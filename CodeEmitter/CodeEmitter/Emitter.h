@@ -671,7 +671,7 @@ public:
       uint32_t Inst = *Instruction & ~InstMask;
       Inst |= (Offset & 0b11) << 29;
       Inst |= (Offset >> 2) << 5;
-      *Instruction = Inst;
+      *WritePtr(Instruction) = Inst;
       break;
     }
     case ForwardLabel::InstType::ADRP: {
@@ -689,7 +689,7 @@ public:
       uint32_t Inst = *Instruction & ~InstMask;
       Inst |= (Offset & 0b11) << 29;
       Inst |= (Offset >> 2) << 5;
-      *Instruction = Inst;
+      *WritePtr(Instruction) = Inst;
       break;
     }
     case ForwardLabel::InstType::B: {
@@ -704,7 +704,7 @@ public:
       uint32_t Offset = static_cast<uint32_t>(Imm) & InstMask;
       uint32_t Inst = *Instruction & ~InstMask;
       Inst |= Offset;
-      *Instruction = Inst;
+      *WritePtr(Instruction) = Inst;
 
       break;
     }
@@ -720,7 +720,7 @@ public:
       uint32_t Offset = static_cast<uint32_t>(Imm) & InstMask;
       uint32_t Inst = *Instruction & ~(InstMask << 5);
       Inst |= Offset << 5;
-      *Instruction = Inst;
+      *WritePtr(Instruction) = Inst;
 
       break;
     }
@@ -737,7 +737,7 @@ public:
       uint32_t Offset = static_cast<uint32_t>(Imm) & InstMask;
       uint32_t Inst = *Instruction & ~(InstMask << 5);
       Inst |= Offset << 5;
-      *Instruction = Inst;
+      *WritePtr(Instruction) = Inst;
       break;
     }
     case ForwardLabel::InstType::LONG_ADDRESS_GEN: {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/TypeDefines.h>
+#include "Windows/Common/DualView.h"
 #include "Windows/Common/FEXUnixLib.h"
 
 #include <array>
@@ -21,6 +22,13 @@ void SetupHooks(HMODULE ntdll) {
     .VirtualName = UnixLib::VirtualName,
     .VirtualTHPControl = UnixLib::VirtualTHPControl,
   };
+
+#ifdef ARCHITECTURE_arm64ec
+  // Executable memory comes from the dual view (the WoW64 build has none: its code stays in RWX memory)
+  DualView::Init();
+  Ptrs.AllocExec = DualView::AllocExec;
+  Ptrs.FreeExec = DualView::FreeExec;
+#endif
 
   SYSTEM_INFO system_info {};
   GetSystemInfo(&system_info);

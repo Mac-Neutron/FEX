@@ -511,7 +511,7 @@ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, 
     BranchEmit.b(BranchOffset);
   }
 
-  std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(CallerAddress)).store(BranchInst, std::memory_order::relaxed);
+  std::atomic_ref<uint32_t>(*ARMEmitter::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(CallerAddress))).store(BranchInst, std::memory_order::relaxed);
   ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
 }
 
@@ -522,7 +522,7 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
   // Restore branch +2 instructions to jump to the linker block
   BranchEmit.b(0x2);
 
-  std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress)).store(BranchInst, std::memory_order::relaxed);
+  std::atomic_ref<uint32_t>(*ARMEmitter::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(JumpThunkStartAddress))).store(BranchInst, std::memory_order::relaxed);
   ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
 
   // No need to reset HostCode here as the exit linker pointer is stored separately, and if the block is relinked it will be updated.
@@ -589,11 +589,11 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
         GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, false); }, lk);
     }
 
-    std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(CallerAddress)).store(BranchInst, std::memory_order::relaxed);
+    std::atomic_ref<uint32_t>(*ARMEmitter::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(CallerAddress))).store(BranchInst, std::memory_order::relaxed);
     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
   } else {
     // This case is common between calls and jumps as the thunk callsite can be left untouched.
-    std::atomic_ref<uint64_t>(Record->HostCode).store(HostCode, std::memory_order::seq_cst);
+    std::atomic_ref<uint64_t>(ARMEmitter::DualMap::WriteAddr(Record)->HostCode).store(HostCode, std::memory_order::seq_cst);
 #ifdef ARCHITECTURE_arm64
     // Make memory write visible to other threads reading the same location
     asm volatile("dc cvau, %0; dsb ish" : : "r"(Record->HostCode) :);
@@ -602,7 +602,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     uint32_t LdrInst = 0;
     ARMEmitter::Emitter LdrEmit(reinterpret_cast<uint8_t*>(&LdrInst), 4);
     LdrEmit.ldr(TMP1, reinterpret_cast<uint64_t>(&Record->HostCode) - JumpThunkStartAddress);
-    std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress)).store(LdrInst, std::memory_order::relaxed);
+    std::atomic_ref<uint32_t>(*ARMEmitter::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(JumpThunkStartAddress))).store(LdrInst, std::memory_order::relaxed);
     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
 
     Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
@@ -1118,7 +1118,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     CodeData.HostCodeOffset = CodeData.BlockBegin - CurrentCodeBuffer->GetBufferBase();
 
     // Copy over CodeBuffer contents
-    memcpy(AllocatedInfo.BufferAllocationOffset, TempCodeBuffer, CodeData.Size);
+    memcpy(ARMEmitter::DualMap::WriteAddr(AllocatedInfo.BufferAllocationOffset), TempCodeBuffer, CodeData.Size);
   }
 
   TempCodeBufferAllocator.DelayedDisownBuffer();
@@ -1163,7 +1163,7 @@ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> H
   auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());
 
   uint8_t* Dest = AllocatedInfo.BufferAllocationOffset;
-  memcpy(Dest, HostBytes.data(), HostBytes.size());
+  memcpy(ARMEmitter::DualMap::WriteAddr(Dest), HostBytes.data(), HostBytes.size());
   ClearICache(Dest, HostBytes.size());
 
   CPUBackend::CompiledCode Result;
