@@ -2,6 +2,8 @@
 #include "Interface/Core/LookupCache.h"
 #include "Interface/Core/SharedCodeBufferManager.h"
 
+#include <CodeEmitter/Buffer.h>
+
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -21,11 +23,13 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
 
-  // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
-  uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
-  if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
-                                          FEXCore::Allocator::ProtectOptions::None)) {
-    LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+  // Protect the last page of the allocated buffer to trigger SIGSEGV on write access, in the view that runs and in the
+  // one that is written (the same page unless the buffer is dual-mapped; see ARMEmitter::DualMap)
+  auto LastPage = reinterpret_cast<void*>(AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE));
+  for (auto Page : {LastPage, ARMEmitter::DualMap::WriteAddr(LastPage)}) {
+    if (!FEXCore::Allocator::VirtualProtect(Page, FEXCore::Utils::FEX_PAGE_SIZE, FEXCore::Allocator::ProtectOptions::None)) {
+      LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+    }
   }
 
   if (ShouldBeNamed) {

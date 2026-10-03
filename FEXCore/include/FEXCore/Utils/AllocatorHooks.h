@@ -37,16 +37,30 @@ FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize);
 #else
 using VirtualNamePtr = void (*)(const char*, const void*, size_t);
 using VirtualTHPPtr = void (*)(const void*, size_t, THPControl);
+// Optional: where executable memory comes from (ARM64EC: the dual view, Source/Windows/Common/DualView.h). AllocExec
+// returns nullptr when it can't; FreeExec returns false for memory it didn't allocate.
+using AllocExecPtr = void* (*)(size_t);
+using FreeExecPtr = bool (*)(void*, size_t);
 struct HookPtrs {
   VirtualNamePtr VirtualName;
   VirtualTHPPtr VirtualTHPControl;
+  AllocExecPtr AllocExec;
+  FreeExecPtr FreeExec;
 };
 FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize, HookPtrs Ptrs);
 #endif
 FEX_DEFAULT_VISIBILITY void ClearHooks();
 
 #ifdef _WIN32
+FEX_DEFAULT_VISIBILITY extern AllocExecPtr AllocExec;
+FEX_DEFAULT_VISIBILITY extern FreeExecPtr FreeExec;
+
 inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
+  if (Execute && !Base && AllocExec) {
+    if (auto Ptr = AllocExec(Size)) {
+      return Ptr;
+    }
+  }
   // Allocate top-down to avoid polluting the lower VA space, as even on 64-bit some programs (i.e. LuaJIT) require allocations below 4GB.
   DWORD Flags = (Commit ? MEM_COMMIT : 0) | MEM_RESERVE | MEM_TOP_DOWN;
 #ifdef ARCHITECTURE_arm64ec
@@ -67,6 +81,9 @@ inline void* VirtualAlloc(size_t Size, bool Execute = false, bool Commit = true)
 }
 
 inline void VirtualFree(void* Ptr, size_t Size) {
+  if (FreeExec && FreeExec(Ptr, Size)) {
+    return;
+  }
   ::VirtualFree(Ptr, 0, MEM_RELEASE);
 }
 

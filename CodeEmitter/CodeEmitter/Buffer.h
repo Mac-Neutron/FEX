@@ -6,6 +6,21 @@
 #include <type_traits>
 
 namespace ARMEmitter {
+// Code memory that runs from one view and is written through another: FEX's ARM64EC frontend maps one section twice,
+// read-execute and read-write (Source/Windows/Common/DualView.cpp), and sets these once, before any code is emitted.
+// Code addresses are always the executable view's; a store into code goes to WriteAddr(address). Outside that view,
+// and on every other host, WriteAddr is the identity.
+namespace DualMap {
+  inline uintptr_t ExecBase, ExecSize;
+  inline intptr_t WriteOffset;
+
+  template<typename T>
+  T* WriteAddr(T* Addr) {
+    const auto A = reinterpret_cast<uintptr_t>(Addr);
+    return A - ExecBase < ExecSize ? reinterpret_cast<T*>(A + WriteOffset) : Addr;
+  }
+} // namespace DualMap
+
 class Buffer {
 public:
   Buffer() {
@@ -20,12 +35,13 @@ public:
     BufferBase = Base;
     CurrentOffset = BufferBase;
     Size = BaseSize;
+    WriteOffset = DualMap::WriteAddr(Base) - Base;
   }
 
   template<typename T>
   requires (std::is_trivially_copyable_v<T>)
   void dcn(const T& Data) {
-    std::memcpy(CurrentOffset, &Data, sizeof(Data));
+    std::memcpy(WritePtr(CurrentOffset), &Data, sizeof(Data));
     CurrentOffset += sizeof(Data);
   }
   void dc8(uint8_t Data) {
@@ -43,7 +59,7 @@ public:
 
   void EmitString(const char* String) {
     const auto StringLength = strlen(String);
-    memcpy(CurrentOffset, String, StringLength);
+    memcpy(WritePtr(CurrentOffset), String, StringLength);
     CurrentOffset += StringLength;
   }
 
@@ -53,7 +69,7 @@ public:
     if (!CurrentAlignment) {
       return;
     }
-    std::memset(CurrentOffset, 0, Size - CurrentAlignment);
+    std::memset(WritePtr(CurrentOffset), 0, Size - CurrentAlignment);
     CurrentOffset += Size - CurrentAlignment;
   }
 
@@ -92,9 +108,15 @@ public:
   }
 
 protected:
+  // Where a store to Addr, an address in this buffer, goes (see DualMap).
+  template<typename T>
+  T* WritePtr(T* Addr) const {
+    return reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(Addr) + WriteOffset);
+  }
 
   uint8_t* BufferBase;
   uint8_t* CurrentOffset;
   uint64_t Size;
+  ptrdiff_t WriteOffset;
 };
 } // namespace ARMEmitter
