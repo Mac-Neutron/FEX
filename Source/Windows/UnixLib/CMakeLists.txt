@@ -6,7 +6,10 @@ include(GNUInstallDirs)
 function(CreateLib TargetName LibName)
   add_library(${TargetName} SHARED FEXUnixLib.cpp)
   set_target_properties(${TargetName} PROPERTIES OUTPUT_NAME ${LibName} PREFIX "lib" SUFFIX ".so")
-  target_link_libraries(${TargetName} PRIVATE rt)
+  if (NOT APPLE)
+    # macOS has no librt: shm_open and clock_gettime are in libSystem.
+    target_link_libraries(${TargetName} PRIVATE rt)
+  endif()
   install(TARGETS ${TargetName} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Runtime)
 endfunction()
 
