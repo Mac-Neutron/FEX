@@ -63,15 +63,22 @@ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions
   const auto* VolatileAccessTableBegin = reinterpret_cast<IMAGE_VOLATILE_RVA_METADATA*>(Address + VolatileMetadata->VolatileAccessTable);
   const auto* VolatileAccessTableEnd =
     VolatileAccessTableBegin + (VolatileMetadata->VolatileAccessTableSize / sizeof(IMAGE_VOLATILE_RVA_METADATA));
+  // Entries outside the image are dropped and ranges clamped to it, so nothing outlives the module (batch Task 4).
   for (auto It = VolatileAccessTableBegin; It != VolatileAccessTableEnd; It++) {
-    VolatileInstructions.emplace(Address + It->Rva);
+    if (Address + It->Rva < EndAddress) {
+      VolatileInstructions.emplace(Address + It->Rva);
+    }
   }
 
   const auto* VolatileInfoRangeTableBegin = reinterpret_cast<IMAGE_VOLATILE_RANGE_METADATA*>(Address + VolatileMetadata->VolatileInfoRangeTable);
   const auto* VolatileInfoRangeTableEnd =
     VolatileInfoRangeTableBegin + (VolatileMetadata->VolatileInfoRangeTableSize / sizeof(IMAGE_VOLATILE_RANGE_METADATA));
   for (auto It = VolatileInfoRangeTableBegin; It != VolatileInfoRangeTableEnd; It++) {
-    VolatileValidRanges.Insert({Address + It->Rva, Address + It->Rva + It->Size});
+    const uint64_t Begin = Address + It->Rva;
+    const uint64_t End = std::min(Begin + It->Size, EndAddress);
+    if (Begin < End) {
+      VolatileValidRanges.Insert({Begin, End});
+    }
   }
 }
 
@@ -185,7 +192,9 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
   uint64_t EndAddress = Address + Nt->OptionalHeader.SizeOfImage;
   fextl::set<uint64_t> VolatileInstructions {};
   FEXCore::IntervalList<uint64_t> VolatileValidRanges {};
-  LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress);
+  if (VolatileMetadataConfig()) {
+    LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress);
+  }
   if (auto It = ExtendedMetaData.find(ID); It != ExtendedMetaData.end()) {
     FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address, EndAddress);
   }
@@ -194,7 +203,14 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
   }
 
   if (!VolatileInstructions.empty() || !VolatileValidRanges.Empty()) {
-    LogMan::Msg::DFmt("Loaded volatile metadata for {:X}: {} entries", Address, VolatileInstructions.size());
+    size_t Ranges = 0;
+    uint64_t Bytes = 0;
+    for (const auto& Range : VolatileValidRanges) {
+      ++Ranges;
+      Bytes += Range.End - Range.Offset;
+    }
+    LogMan::Msg::IFmt("volatile metadata: {} at {:X}: {} instructions, {} ranges, {} bytes", ModuleName, Address,
+                      VolatileInstructions.size(), Ranges, Bytes);
     CTX.AddForceTSOInformation(VolatileValidRanges, std::move(VolatileInstructions));
   }
 

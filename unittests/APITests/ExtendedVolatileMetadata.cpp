@@ -156,3 +156,37 @@ TEST_CASE("Basic - Double - offset") {
     }
   }
 }
+
+// Only a bare module name disables TSO for the whole module: an empty ranges section lists no range (batch Task 4).
+TEST_CASE("Basic - Single - empty ranges") {
+  const auto String = "hl2_linux;";
+  const auto Result = FEX::VolatileMetadata::ParseExtendedVolatileMetadata(String);
+  REQUIRE(Result.size() == 1);
+  REQUIRE(Result.contains("hl2_linux"));
+  CHECK(Result.at("hl2_linux").ModuleTSODisabled == false);
+  CHECK(Result.at("hl2_linux").VolatileInstructions.empty());
+  CHECK(Result.at("hl2_linux").VolatileValidRanges.Empty());
+}
+
+TEST_CASE("Basic - Single - empty ranges plus instruction") {
+  const auto String = "hl2_linux;;0x1,0x2";
+  const auto Result = FEX::VolatileMetadata::ParseExtendedVolatileMetadata(String);
+  REQUIRE(Result.size() == 1);
+  REQUIRE(Result.contains("hl2_linux"));
+  CHECK(Result.at("hl2_linux").ModuleTSODisabled == false);
+  CHECK(Result.at("hl2_linux").VolatileValidRanges.Empty());
+  CHECK(Result.at("hl2_linux").VolatileInstructions == fextl::set<uint64_t> {1, 2});
+}
+
+// Ranges are clamped to the mapping, so none outlives it (batch Task 4).
+TEST_CASE("Apply - ranges clamped to the module") {
+  auto Result = FEX::VolatileMetadata::ParseExtendedVolatileMetadata("hl2_linux;0x0-0x100000,0x200000-0x300000");
+  fextl::set<uint64_t> Instructions;
+  FEXCore::IntervalList<uint64_t> Ranges;
+  FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(Result.at("hl2_linux"), Instructions, Ranges, 0x10000, 0x28000);
+  std::vector<std::pair<uint64_t, uint64_t>> Got;
+  for (auto it : Ranges) {
+    Got.emplace_back(it.Offset, it.End);
+  }
+  CHECK(Got == std::vector<std::pair<uint64_t, uint64_t>> {{0x10000, 0x28000}});
+}

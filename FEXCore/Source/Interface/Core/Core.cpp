@@ -573,14 +573,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
       }
 #endif
 
-      bool BlockInForceTSOValidRange = false;
-      auto InstForceTSOIt = ForceTSOInstructions.end();
-      if (ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
-        if (auto It = ForceTSOInstructions.lower_bound(Block.Entry); It != ForceTSOInstructions.end() && *It < Block.Entry + Block.Size) {
-          InstForceTSOIt = It;
-          BlockInForceTSOValidRange = true;
-        }
-      }
+      // A block inside a valid range runs without TSO except for its listed and MonoHacks-flagged accesses (batch Task 4).
+      const bool BlockInForceTSOValidRange = ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size});
+      auto InstForceTSOIt = BlockInForceTSOValidRange ? ForceTSOInstructions.lower_bound(Block.Entry) : ForceTSOInstructions.end();
 
       // Set the block entry point
       Thread->OpDispatcher->SetNewBlockIfChanged(Block.Entry);
@@ -665,13 +660,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->ResetHandledLock();
           Thread->OpDispatcher->ResetDecodeFailure();
           IR::ForceTSOMode ForceTSO = IR::ForceTSOMode::NoOverride;
+          const bool Flagged = DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO;
           if (BlockInForceTSOValidRange) {
-            if (InstForceTSOIt != ForceTSOInstructions.end() && *InstForceTSOIt == InstAddress) {
-              ForceTSO = IR::ForceTSOMode::ForceEnabled;
-            } else {
-              ForceTSO = IR::ForceTSOMode::ForceDisabled;
-            }
-          } else if (DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) {
+            const bool Listed = InstForceTSOIt != ForceTSOInstructions.end() && *InstForceTSOIt == InstAddress;
+            ForceTSO = Listed || Flagged ? IR::ForceTSOMode::ForceEnabled : IR::ForceTSOMode::ForceDisabled;
+          } else if (Flagged) {
             ForceTSO = IR::ForceTSOMode::ForceEnabled;
           }
 
