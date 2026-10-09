@@ -35,10 +35,12 @@ fextl::unordered_map<fextl::string, ExtendedVolatileMetadata> ParseExtendedVolat
       continue;
     }
 
+    // Only a bare module name disables TSO for the whole module: `mod;` and `mod;;<instructions>` list no range
+    // (batch Task 4).
     auto current_module = ExtendedMetaData
                             .insert_or_assign(fextl::string(section_str),
                                               ExtendedVolatileMetadata {
-                                                .ModuleTSODisabled = true,
+                                                .ModuleTSODisabled = module_config.find(';') == std::string_view::npos,
                                               })
                             .first;
     ++section;
@@ -46,11 +48,6 @@ fextl::unordered_map<fextl::string, ExtendedVolatileMetadata> ParseExtendedVolat
     // Address range handling
     if (section != sections_end) {
       std::string_view section_str = *section;
-      if (section_str.empty()) {
-        continue;
-      }
-
-      current_module->second.ModuleTSODisabled = false;
 
       // Walk all the address ranges provided.
       for (auto tso_region_view : ranges::views::split(section_str, ',') | ranges::views::transform(to_string_view)) {

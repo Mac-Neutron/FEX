@@ -6,6 +6,7 @@
 #include <FEXCore/fextl/set.h>
 #include <FEXCore/fextl/string.h>
 
+#include <algorithm>
 #include <string_view>
 
 namespace FEX::VolatileMetadata {
@@ -34,10 +35,15 @@ inline void ApplyFEXExtendedVolatileMetadata(FEX::VolatileMetadata::ExtendedVola
     }
   }
 
-  // Walk the volatile list
+  // Walk the volatile list, each range clamped to [Address, EndAddress) so it can't outlive the mapping (batch Task 4).
+  const uint64_t Size = EndAddress - Address;
   for (const auto it_ranges : ExtendedMetaData.VolatileValidRanges) {
     if (it_ranges.Offset >= FileOffset && it_ranges.End < FileOffsetEnd) {
-      VolatileValidRanges.Insert({Address + it_ranges.Offset - FileOffset, Address + it_ranges.End - FileOffset});
+      const uint64_t Begin = std::min(it_ranges.Offset - FileOffset, Size);
+      const uint64_t End = std::min(it_ranges.End - FileOffset, Size);
+      if (Begin < End) {
+        VolatileValidRanges.Insert({Address + Begin, Address + End});
+      }
     }
   }
 

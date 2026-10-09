@@ -64,6 +64,7 @@ private:
   FEXCore::Context::Context& CTX;
 
   FEX_CONFIG_OPT(ExtendedVolatileMetadataConfig, EXTENDEDVOLATILEMETADATA);
+  FEX_CONFIG_OPT(VolatileMetadataConfig, VOLATILEMETADATA);
   fextl::unordered_map<fextl::string, FEX::VolatileMetadata::ExtendedVolatileMetadata> ExtendedMetaData;
 
   std::shared_mutex ImagesLock;
