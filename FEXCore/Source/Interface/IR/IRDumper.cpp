@@ -172,6 +172,8 @@ static void PrintArg(fextl::ostringstream* out, const IRListView*, NamedVectorCo
         return "u16_incremental_index";
       case NamedVectorConstant::NAMED_VECTOR_INCREMENTAL_U16_INDEX_UPPER:
         return "u16_incremental_index_upper";
+      case NamedVectorConstant::NAMED_VECTOR_INCREMENTAL_U8_INDEX:
+        return "u8_incremental_index";
       case NamedVectorConstant::NAMED_VECTOR_PADDSUBPS_INVERT:
         return "addsubps_invert";
       case NamedVectorConstant::NAMED_VECTOR_PADDSUBPS_INVERT_UPPER:
@@ -346,10 +348,6 @@ static void PrintArg(fextl::ostringstream* out, const IRListView*, BranchHint Ar
     }
     return "<Unknown Branch Hint>";
   }();
-}
-
-static void PrintArg(fextl::ostringstream* out, const IRListView*, const std::array<uint8_t, 0x10>& Arg) {
-  *out << fextl::fmt::format("{:02x}", fmt::join(Arg, ""));
 }
 
 void Dump(fextl::ostringstream* out, const IRListView* IR) {

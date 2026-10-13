@@ -4,8 +4,8 @@
 
 namespace FEXCore {
 
-WorkQueueThread::WorkQueueThread(bool LowPriority) {
-  Thread = FEXCore::Threads::Thread::Create(ThreadEntry, this, LowPriority);
+WorkQueueThread::WorkQueueThread(FEXCore::Threads::Flags ThreadFlags, const char* ThreadName) {
+  Thread = FEXCore::Threads::Thread::Create(ThreadEntry, this, ThreadFlags, ThreadName);
 }
 
 WorkQueueThread::~WorkQueueThread() {

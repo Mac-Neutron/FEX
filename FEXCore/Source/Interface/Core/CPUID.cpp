@@ -458,6 +458,8 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_01h(uint32_t Leaf) const {
             (Cores << 16) |     // Number of addressable IDs for the logical cores in the physical CPU
             (GetCPUID() << 24); // Local APIC ID
 
+  const uint32_t SupportsRAND = CTX->HostFeatures.SupportsRAND || CTX->SoftwareRNGEnabled();
+
   Res.ecx = (1 << 0) |                                      // SSE3
             (CTX->HostFeatures.SupportsPMULL_128Bit << 1) | // PCLMULQDQ
             (1 << 2) |                                      // DS area supports 64bit layout
@@ -488,7 +490,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_01h(uint32_t Leaf) const {
             (SupportsAVX() << 27) |                         // OSXSAVE
             (SupportsAVX() << 28) |                         // AVX
             (SupportsAVX() << 29) |                         // F16C
-            (CTX->HostFeatures.SupportsRAND << 30) |        // RDRAND
+            (SupportsRAND << 30) |                          // RDRAND
             (Hypervisor << 31);
 
   Res.edx = (1 << 0) |  // FPU
@@ -648,6 +650,12 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_06h(uint32_t Leaf) const {
 
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
   FEXCore::CPUID::FunctionResults Res {};
+
+  // AVX-VNNI is only advertised when the CPU supports I8MM or Dot Product.
+  // Without these features the implementation is so slow that it is likely
+  // to harm performance.
+  const uint32_t SupportsAVXVNNI = SupportsAVX() && (CTX->HostFeatures.SupportsI8MM || CTX->HostFeatures.SupportsDotProd);
+
   if (Leaf == 0) {
 #ifndef _WIN32
     constexpr uint32_t SUPPORTS_RDPID = 1;
@@ -664,40 +672,44 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
     const uint32_t SupportsVPCLMULQDQ = CTX->HostFeatures.SupportsPMULL_128Bit && SupportsAVX();
     const uint32_t SupportsWFXT = CTX->HostFeatures.SupportsWFXT;
 
+    const uint32_t SupportsRAND = CTX->HostFeatures.SupportsRAND || CTX->SoftwareRNGEnabled();
+
     // Number of subfunctions
-    Res.eax = 0x0;
-    Res.ebx = (1 << 0) |                               // FS/GS support
-              (0 << 1) |                               // TSC adjust MSR
-              (0 << 2) |                               // SGX
-              (SupportsAVX() << 3) |                   // BMI1
-              (0 << 4) |                               // Intel Hardware Lock Elison
-              (SupportsAVX() << 5) |                   // AVX2 support
-              (1 << 6) |                               // FPU data pointer updated only on exception
-              (1 << 7) |                               // SMEP support
-              (SupportsAVX() << 8) |                   // BMI2
-              (SupportsEnhancedREPMOVS << 9) |         // Enhanced REP MOVSB/STOSB
-              (1 << 10) |                              // INVPCID for system software control of process-context
-              (0 << 11) |                              // Restricted transactional memory
-              (0 << 12) |                              // Intel resource directory technology Monitoring
-              (1 << 13) |                              // Deprecates FPU CS and DS
-              (0 << 14) |                              // Intel MPX
-              (0 << 15) |                              // Intel Resource Directory Technology Allocation
-              (0 << 16) |                              // AVX512-F
-              (0 << 17) |                              // AVX512-DQ
-              (CTX->HostFeatures.SupportsRAND << 18) | // RDSEED
-              (1 << 19) |                              // ADCX and ADOX instructions
-              (0 << 20) |                              // SMAP Supervisor mode access prevention and CLAC/STAC instructions
-              (0 << 21) |                              // AVX512-IFMA
-              (0 << 22) |                              // PCOMMIT (deprecated?)
-              (1 << 23) |                              // CLFLUSHOPT instruction
-              (1 << 24) |                              // CLWB instruction
-              (0 << 25) |                              // Intel processor trace
-              (0 << 26) |                              // AVX512-PF
-              (0 << 27) |                              // AVX512-ER
-              (0 << 28) |                              // AVX512-CD
-              (Features.SHA << 29) |                   // SHA instructions
-              (0 << 30) |                              // AVX512-BW
-              (0 << 31);                               // AVX512-VL
+    // TODO: For now, subfunction 1 only exposes AVX-VNNI so we make it conditional
+    // on AVX-VNNI support. We should revisit this if/when we add more to this leaf.
+    Res.eax = SupportsAVXVNNI;
+    Res.ebx = (1 << 0) |                       // FS/GS support
+              (0 << 1) |                       // TSC adjust MSR
+              (0 << 2) |                       // SGX
+              (SupportsAVX() << 3) |           // BMI1
+              (0 << 4) |                       // Intel Hardware Lock Elison
+              (SupportsAVX() << 5) |           // AVX2 support
+              (1 << 6) |                       // FPU data pointer updated only on exception
+              (1 << 7) |                       // SMEP support
+              (SupportsAVX() << 8) |           // BMI2
+              (SupportsEnhancedREPMOVS << 9) | // Enhanced REP MOVSB/STOSB
+              (1 << 10) |                      // INVPCID for system software control of process-context
+              (0 << 11) |                      // Restricted transactional memory
+              (0 << 12) |                      // Intel resource directory technology Monitoring
+              (1 << 13) |                      // Deprecates FPU CS and DS
+              (0 << 14) |                      // Intel MPX
+              (0 << 15) |                      // Intel Resource Directory Technology Allocation
+              (0 << 16) |                      // AVX512-F
+              (0 << 17) |                      // AVX512-DQ
+              (SupportsRAND << 18) |           // RDSEED
+              (1 << 19) |                      // ADCX and ADOX instructions
+              (0 << 20) |                      // SMAP Supervisor mode access prevention and CLAC/STAC instructions
+              (0 << 21) |                      // AVX512-IFMA
+              (0 << 22) |                      // PCOMMIT (deprecated?)
+              (1 << 23) |                      // CLFLUSHOPT instruction
+              (1 << 24) |                      // CLWB instruction
+              (0 << 25) |                      // Intel processor trace
+              (0 << 26) |                      // AVX512-PF
+              (0 << 27) |                      // AVX512-ER
+              (0 << 28) |                      // AVX512-CD
+              (Features.SHA << 29) |           // SHA instructions
+              (0 << 30) |                      // AVX512-BW
+              (0 << 31);                       // AVX512-VL
 
     Res.ecx = (1 << 0) |                                // PREFETCHWT1
               (0 << 1) |                                // AVX512VBMI
@@ -765,38 +777,38 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
               (0 << 30) |                  // Arch capabilities - MSR module specific
               (0 << 31);                   // SSBD - Speculative Store Bypass Disable
   } else if (Leaf == 1) {
-    Res.eax = (0U << 0) |  // SHA512
-              (0U << 1) |  // SM3
-              (0U << 2) |  // SM4
-              (0U << 3) |  // RAO_INT
-              (0U << 4) |  // AVX_VNNI
-              (0U << 5) |  // AVX512_BF16
-              (0U << 6) |  // LASS (Linear Address Space Separation)
-              (0U << 7) |  // CMPCCXADD
-              (0U << 8) |  // ARCH_PERFMON_EXT
-              (0U << 9) |  // Reserved
-              (0U << 10) | // FAST_REP_MOVSB
-              (0U << 11) | // FAST_REP_STOSB
-              (0U << 12) | // FAST_REP_CMPSB_SCASB
-              (0U << 13) | // Reserved
-              (0U << 14) | // Reserved
-              (0U << 15) | // Reserved
-              (0U << 16) | // Reserved
-              (0U << 17) | // FRED (Flexible Return and Event Delivery)
-              (0U << 18) | // LKGS (Load into Kernel GS Base)
-              (0U << 19) | // WRMSRNS
-              (0U << 20) | // NMI_SRC
-              (0U << 21) | // AMX_FP16
-              (0U << 22) | // HRESET
-              (0U << 23) | // AVX_IFMA
-              (0U << 24) | // Reserved
-              (0U << 25) | // Reserved
-              (0U << 26) | // LAM (Linear Address Masking)
-              (0U << 27) | // MSRLIST
-              (0U << 28) | // Reserved
-              (0U << 29) | // Reserved
-              (0U << 30) | // INVD_DISABLE_POST_BIOS_DONE
-              (0U << 31);  // MOVRS
+    Res.eax = (0U << 0) |              // SHA512
+              (0U << 1) |              // SM3
+              (0U << 2) |              // SM4
+              (0U << 3) |              // RAO_INT
+              (SupportsAVXVNNI << 4) | // AVX_VNNI
+              (0U << 5) |              // AVX512_BF16
+              (0U << 6) |              // LASS (Linear Address Space Separation)
+              (0U << 7) |              // CMPCCXADD
+              (0U << 8) |              // ARCH_PERFMON_EXT
+              (0U << 9) |              // Reserved
+              (0U << 10) |             // FAST_REP_MOVSB
+              (0U << 11) |             // FAST_REP_STOSB
+              (0U << 12) |             // FAST_REP_CMPSB_SCASB
+              (0U << 13) |             // Reserved
+              (0U << 14) |             // Reserved
+              (0U << 15) |             // Reserved
+              (0U << 16) |             // Reserved
+              (0U << 17) |             // FRED (Flexible Return and Event Delivery)
+              (0U << 18) |             // LKGS (Load into Kernel GS Base)
+              (0U << 19) |             // WRMSRNS
+              (0U << 20) |             // NMI_SRC
+              (0U << 21) |             // AMX_FP16
+              (0U << 22) |             // HRESET
+              (0U << 23) |             // AVX_IFMA
+              (0U << 24) |             // Reserved
+              (0U << 25) |             // Reserved
+              (0U << 26) |             // LAM (Linear Address Masking)
+              (0U << 27) |             // MSRLIST
+              (0U << 28) |             // Reserved
+              (0U << 29) |             // Reserved
+              (0U << 30) |             // INVD_DISABLE_POST_BIOS_DONE
+              (0U << 31);              // MOVRS
 
     // Bits 4-31 currently reserved.
     Res.ebx = (0U << 0) | // PPIN

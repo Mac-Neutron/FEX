@@ -4,6 +4,7 @@ set(FEXCORE_BASE_SRCS
   Interface/Config/Config.cpp
   Utils/Allocator.cpp
   Utils/FileLoading.cpp
+  Utils/FileUtils.cpp
   Utils/ForcedAssert.cpp
   Utils/LogManager.cpp
   Utils/SpinWaitLock.cpp
@@ -261,6 +262,10 @@ endfunction()
 # Build FEXCore_Base static library
 add_library(FEXCore_Base STATIC ${FEXCORE_BASE_SRCS})
 target_link_libraries(FEXCore_Base PUBLIC ${LIBS})
+if (MINGW)
+  target_link_libraries(FEXCore_Base PUBLIC ntdll)
+endif()
+
 AddDefaultOptionsToTarget(FEXCore_Base)
 
 if (ENABLE_FEXCORE_PROFILER AND FEXCORE_PROFILER_BACKEND STREQUAL "TRACY")
@@ -303,6 +308,7 @@ add_library(JemallocLibs STATIC Utils/AllocatorHooks.cpp)
 if (ENABLE_FEX_ALLOCATOR)
   target_compile_definitions(JemallocLibs PRIVATE ENABLE_FEX_ALLOCATOR=1)
   target_link_libraries(JemallocLibs PUBLIC rpmalloc)
+  target_include_directories(JemallocLibs PRIVATE "${PROJECT_SOURCE_DIR}/include/")
 endif()
 if (ENABLE_JEMALLOC_GLIBC_ALLOC)
   set_source_files_properties(Interface/HLE/Thunks/Thunks.cpp PROPERTIES COMPILE_DEFINITIONS ENABLE_JEMALLOC_GLIBC=1)

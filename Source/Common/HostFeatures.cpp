@@ -374,6 +374,8 @@ static void OverrideFeatures(FEXCore::HostFeatures* Features, uint64_t ForceSVEW
   ENABLE_DISABLE_OPTION(Supports3DNow, 3DNOW, 3DNOW);
   ENABLE_DISABLE_OPTION(SupportsSSE4a, SSE4A, SSE4A);
   ENABLE_DISABLE_OPTION(SupportsMOPS, MOPS, MOPS);
+  ENABLE_DISABLE_OPTION(SupportsI8MM, I8MM, I8MM);
+  ENABLE_DISABLE_OPTION(SupportsDotProd, DOTPROD, DOTPROD);
   GET_SINGLE_OPTION(Crypto, CRYPTO);
 
 #undef ENABLE_DISABLE_OPTION
@@ -504,6 +506,8 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   HostFeatures.SupportsSVEBitPerm = Features.Supports(CPUFeatures::Feature::SVE_BitPerm);
   HostFeatures.SupportsECV = Features.Supports(CPUFeatures::Feature::ECV);
   HostFeatures.SupportsWFXT = Features.Supports(CPUFeatures::Feature::WFxt);
+  HostFeatures.SupportsI8MM = Features.Supports(CPUFeatures::Feature::I8MM);
+  HostFeatures.SupportsDotProd = Features.Supports(CPUFeatures::Feature::DotProd);
 
 #ifdef VIXL_SIMULATOR
   // Hardcode enable SVE with 256-bit wide registers.
@@ -537,6 +541,7 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   }
 #endif
 
+  HostFeatures.Supports3DNow = true;
   HostFeatures.SupportsAVX = true;
   HostFeatures.SupportsAES256 = HostFeatures.SupportsAVX && HostFeatures.SupportsAES;
   HostFeatures.SupportsPreserveAllABI = FEX_HAS_PRESERVE_ALL_ATTR;
@@ -552,15 +557,6 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   if (!HostFeatures.SupportsAtomics) {
     WARN_ONCE_FMT("Host CPU doesn't support atomics. Expect bad performance");
   }
-
-#ifdef _WIN32
-  // Disable 3DNow! by default to better match the set of extensions exposed on modern CPUs.
-  // This works around a bug that manifests in some games using native d3dx9 DLLs (most easily reproduced in WoW64 builds).
-  // For example, Fallout: New Vegas and some old EA games will run with a blackscreen.
-  HostFeatures.Supports3DNow = false;
-#else
-  HostFeatures.Supports3DNow = true;
-#endif
 
 #ifdef ARCHITECTURE_arm64
   // Test if this CPU supports float exception trapping by attempting to enable
@@ -637,6 +633,7 @@ FEXCore::HostFeatures FetchHostFeatures() {
 
   HostFeatures.SupportsCPUIndexInTPIDRRO = false;
   HostFeatures.HostType = FEXCore::HostFeatures::HostTypeEnum::Linux;
+  HostFeatures.ProcessPID = ::getpid();
   return HostFeatures;
 }
 } // namespace FEX

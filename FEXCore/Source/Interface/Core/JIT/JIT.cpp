@@ -36,7 +36,14 @@ $end_info$
 
 #include <cstdio>
 #include <cstring>
+#include <optional>
+#include <type_traits>
 #include <unistd.h>
+#ifdef _WIN32
+#include <atomic>
+#else
+#include <FEXHeaderUtils/Syscalls.h>
+#endif
 
 namespace {
 struct DivRem {
@@ -63,8 +70,36 @@ LDIV(uint64_t SrcHigh, uint64_t SrcLow, int64_t Divisor) {
   };
 }
 
-static void
-PrintValue(uint64_t Value) {
+#ifndef _WIN32
+
+static std::optional<uint64_t>
+RDRANDFallback(uint64_t Reseed) {
+  uint64_t Value {};
+  FHU::Syscalls::getrandom(&Value, sizeof(Value), 0);
+  return Value;
+}
+
+#else
+
+// Windows does not have an equivalent to getrandom() without dynamically linking
+// bcrypt et al. Since this fallback is just for compat it does not need to be
+// cryptographic, so instead we vendor SplitMix64 as a naive fallback.
+
+// Reference implementation by Sebastiano Vigna, public domain (CC0)
+// https://prng.di.unimi.it/splitmix64.c
+static std::atomic<uint64_t>
+  RNGState {static_cast<uint64_t>(__builtin_readcyclecounter())};
+
+static std::optional<uint64_t> RDRANDFallback(uint64_t Reseed) {
+  const uint64_t State = RNGState.load(std::memory_order_relaxed) + 0x9E3779B97F4A7C15ULL;
+  RNGState.store(State, std::memory_order_relaxed);
+  uint64_t Value = (State ^ (State >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  Value = (Value ^ (Value >> 27)) * 0x94D049BB133111EBULL;
+  return Value ^ (Value >> 31);
+}
+#endif
+
+static void PrintValue(uint64_t Value) {
   LogMan::Msg::DFmt("Value: 0x{:x}", Value);
 }
 
@@ -664,6 +699,7 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
     Ptrs.ExitFunctionLink = reinterpret_cast<uintptr_t>(&Arm64JITCore::ExitFunctionLink);
     Ptrs.LUDIV = reinterpret_cast<uint64_t>(LUDIV);
     Ptrs.LDIV = reinterpret_cast<uint64_t>(LDIV);
+    Ptrs.RDRANDFallback = reinterpret_cast<uint64_t>(RDRANDFallback);
   }
 
   CurrentCodeBuffer = SharedCodeBuffers.GetLatest();
@@ -766,7 +802,7 @@ void Arm64JITCore::EmitTFCheck() {
 void Arm64JITCore::EmitSuspendInterruptCheck() {
   if (CTX->Config.NeedsPendingInterruptFaultCheck) {
     // Trigger a fault if there are any pending interrupts
-    // Used only for suspend on WIN32 at the moment
+    // Used only for gdbserver at the moment
     constexpr size_t InterruptPageOffset =
       offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
     if constexpr (InterruptPageOffset <= 32760) {
@@ -778,7 +814,7 @@ void Arm64JITCore::EmitSuspendInterruptCheck() {
     }
   }
 
-#ifdef ARCHITECTURE_arm64ec
+#ifdef _WIN32
   static constexpr uint16_t SuspendMagic {0xCAFE};
 
   ldr(TMP2.W(), STATE_PTR(CpuStateFrame, SuspendDoorbell));
@@ -1019,9 +1055,15 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
     // This is a ExitFunctionLinkData struct
     BindOrRestart(&l_ExitLink);
-    dc64(0);                                                                   // HostCode
-    PlaceNamedSymbolLiteral(InsertGuestRIPLiteral(PendingJumpThunk.GuestRIP)); // GuestRIP
-    dc64(PendingJumpThunk.CallerAddress - ThunkAddress);                       // CallerOffset
+    dc64(0); // HostCode
+    if (PendingJumpThunk.PatchSiteAddress) {
+      // GuestRIP with an extra step
+      PlaceNamedSymbolLiteral(
+        InsertGuestPatchableRIPLiteral(PendingJumpThunk.GuestRIP, PendingJumpThunk.PatchSiteAddress, PendingJumpThunk.PatchSiteSize));
+    } else {
+      PlaceNamedSymbolLiteral(InsertGuestRIPLiteral(PendingJumpThunk.GuestRIP)); // GuestRIP
+    }
+    dc64(PendingJumpThunk.CallerAddress - ThunkAddress); // CallerOffset
   }
 
   BindOrRestart(&l_ExitLink);
@@ -1157,7 +1199,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   return std::move(CodeData);
 }
 
-CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes, std::span<const DiskCache::BlobEntryPoint> EntryPoints) {
+CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes) {
   // we stored it aligned, better still be?
   LOGMAN_THROW_A_FMT(HostBytes.size() % 16 == 0, "Needs to be 16B aligned!");
   auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());
@@ -1170,9 +1212,6 @@ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> H
   Result.BlockBegin = Dest;
   Result.Size = HostBytes.size();
   Result.HostCodeOffset = Dest - CurrentCodeBuffer->GetBufferBase();
-  for (const auto& Ep : EntryPoints) {
-    Result.EntryPoints[Ep.GuestRIP] = Dest + Ep.HostOffset;
-  }
   return Result;
 }
 

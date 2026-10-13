@@ -32,7 +32,6 @@ extern "C" {
 
 #define STATUS_EMULATION_SYSCALL ((NTSTATUS)0x40000039)
 
-#ifdef ARCHITECTURE_arm64ec
 typedef struct _CHPE_V2_CPU_AREA_INFO {
   BOOLEAN InSimulation;             /* 000 */
   BOOLEAN InSyscallCallback;        /* 001 */
@@ -44,7 +43,6 @@ typedef struct _CHPE_V2_CPU_AREA_INFO {
   void* EmulatorData[4];            /* 030 */
   ULONG64 EmulatorDataInline;       /* 050 */
 } CHPE_V2_CPU_AREA_INFO, *PCHPE_V2_CPU_AREA_INFO;
-#endif
 
 typedef struct {
   ULONG version;
@@ -340,10 +338,8 @@ typedef struct __TEB {                          /* win32/win64 */
   PVOID* TlsExpansionSlots;          /* f94/1780 */
 #ifdef _WIN64
   union {
-    PVOID DeallocationBStore; /*    /1788 */
-#ifdef ARCHITECTURE_arm64ec
+    PVOID DeallocationBStore;                 /*    /1788 */
     CHPE_V2_CPU_AREA_INFO* ChpeV2CpuAreaInfo; /*    /1788 */
-#endif
   } DUMMYUNIONNAME;
   PVOID BStoreLimit; /*    /1790 */
 #endif
@@ -558,6 +554,7 @@ NTSTATUS WINAPI NtQueryDirectoryFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO
                                      BOOLEAN, PUNICODE_STRING, BOOLEAN);
 NTSTATUS WINAPI NtQueryValueKey(HANDLE, const UNICODE_STRING*, KEY_VALUE_INFORMATION_CLASS, void*, DWORD, DWORD*);
 NTSTATUS WINAPI NtQueryVirtualMemory(HANDLE, LPCVOID, MEMORY_INFORMATION_CLASS, PVOID, SIZE_T, SIZE_T*);
+NTSTATUS WINAPI NtRaiseException(EXCEPTION_RECORD*, CONTEXT*, BOOL);
 NTSTATUS WINAPI NtReadFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
 NTSTATUS WINAPI NtSetContextThread(HANDLE, const CONTEXT*);
 NTSTATUS WINAPI NtSuspendThread(HANDLE, PULONG);

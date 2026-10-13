@@ -30,6 +30,7 @@ $end_info$
 #include "Interface/IR/RegisterAllocationData.h"
 #include "Utils/Allocator.h"
 #include "Utils/Allocator/HostAllocator.h"
+#include "Utils/crc32.h"
 #include <FEXCore/Utils/SpinWaitLock.h>
 #include "Utils/variable_length_integer.h"
 
@@ -89,7 +90,7 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
 
   if (Config.BlockJITNaming() || Config.GlobalJITNaming() || Config.LibraryJITNaming()) {
     // Only initialize symbols file if enabled. Ensures we don't pollute /tmp with empty files.
-    Symbols.InitFile();
+    Symbols.InitFile(Features.ProcessPID);
   }
 
   uint64_t FrequencyCounter = FEXCore::GetCycleCounterFrequency();
@@ -103,6 +104,14 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
 
   // Track atomic TSO emulation configuration.
   UpdateAtomicTSOEmulationConfig();
+
+#ifndef _WIN32
+  // Check if the kernel supports getrandom().
+  uint64_t Probe {};
+  HostRNGAvailable = FHU::Syscalls::getrandom(&Probe, sizeof(Probe), 0) == sizeof(Probe);
+#else
+  HostRNGAvailable = true;
+#endif
 
   DiskCache.Init(this);
 }
@@ -355,11 +364,6 @@ bool ContextImpl::InitCore() {
   // Set up the SignalDelegator config since core is initialized.
   SignalDelegation->SetConfig(Dispatcher->MakeSignalDelegatorConfig());
 
-#if defined(_WIN32) && !defined(ARCHITECTURE_arm64ec)
-  // WOW64 always needs the interrupt fault check to be enabled.
-  Config.NeedsPendingInterruptFaultCheck = true;
-#endif
-
   if (Config.GdbServer) {
     // If gdbserver is enabled then this needs to be enabled.
     Config.NeedsPendingInterruptFaultCheck = true;
@@ -525,6 +529,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
   bool HasCustomIR {};
 
+  bool WantsDiskCachePatching = DiskCache.IsReadingDiskCache() || DiskCache.IsWritingDiskCache();
+
   if (HasCustomIRHandlers.load(std::memory_order_relaxed)) {
     std::shared_lock lk(CustomIRMutex);
     auto Handler = CustomIRHandlers.find(GuestRIP);
@@ -539,7 +545,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
   if (!HasCustomIR) {
     const auto* GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
 
-    Thread->FrontendDecoder->DecodeInstructionsAtEntry(Thread, GuestCode, GuestRIP, MaxInst);
+    Thread->FrontendDecoder->DecodeLoop(GuestCode);
 
     const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     const auto& CodeBlocks = BlockInfo->Blocks;
@@ -633,9 +639,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
-          std::array<uint8_t, 0x10> CodeOriginal;
-          memcpy(CodeOriginal.data(), ExistingCodePtr, DecodedInfo->InstSize);
-          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CodeOriginal, InstAddressReg, DecodedInfo->InstSize);
+
+          auto Value = FEXCore::Utils::crc32(ExistingCodePtr, DecodedInfo->InstSize);
+          auto CRC = WantsDiskCachePatching ?
+                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)ExistingCodePtr, DecodedInfo->InstSize) :
+                       Thread->OpDispatcher->Constant(Value);
+          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, DecodedInfo->InstSize);
 
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
 
@@ -645,8 +654,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
           Thread->OpDispatcher->SetCurrentCodeBlock(CodeWasChangedBlock);
           Thread->OpDispatcher->StartNewBlock();
-          Thread->OpDispatcher->_ThreadRemoveCodeEntry();
-          Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, InstAddress - GuestRIP));
+
+          // Generate a relocatable entry for invalidation purposes.
+          auto EntryToInvalidate = Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0);
+          auto NewRIP = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
+          // Invalidate and exit the function
+          Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryToInvalidate, NewRIP);
 
           auto NextOpBlock = Thread->OpDispatcher->CreateNewCodeBlockAfter(CurrentBlock);
 
@@ -739,9 +752,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 #endif
 
     Thread->OpDispatcher->Finalize();
-
-    Thread->FrontendDecoder->DelayedDisownBuffer();
   }
+
+  Thread->FrontendDecoder->DelayedDisownBuffer();
 
   IR::IREmitter* IREmitter = Thread->OpDispatcher.get();
 
@@ -782,6 +795,8 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges] =
     GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
   if (!IRView) {
+    Thread->FrontendDecoder->ValidateDisownedOrFree();
+    Thread->OpDispatcher->ValidateDisownedOrFree();
     // OpDispatcher IR already released in this case.
     return {{}, nullptr, 0, 0, false};
   }
@@ -795,6 +810,8 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
     if (auto Block = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
       // Raced to compile, release the OpDispatcher IR.
       Thread->OpDispatcher->DelayedDisownBuffer();
+      Thread->FrontendDecoder->ValidateDisownedOrFree();
+      Thread->OpDispatcher->ValidateDisownedOrFree();
       return {.CompiledCode = {.BlockBegin = reinterpret_cast<uint8_t*>(Block), .EntryPoints = {{GuestRIP, reinterpret_cast<uint8_t*>(Block)}}},
               .DebugData = nullptr,
               .StartAddr = 0,
@@ -813,6 +830,8 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   // Release the IR
   Thread->OpDispatcher->DelayedDisownBuffer();
 
+  Thread->FrontendDecoder->ValidateDisownedOrFree();
+  Thread->OpDispatcher->ValidateDisownedOrFree();
   return {
     .CompiledCode = std::move(CompiledCode),
     .DebugData = std::move(DebugData),
@@ -849,38 +868,42 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     return HostCode;
   }
 
+  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+
   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
   std::optional<DiskCache::CodeHitData> Hit;
-  bool DiskCacheHitRelocationsApplied = false;
-  bool LoadDiskCacheCode = true;
-  if (Region && Region->FileStartVA != 0) {
+  std::optional<uint64_t> DiskCacheGuestCodeKey;
+  {
     FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheLookupTime);
-    Hit = DiskCache.Lookup(Thread, *Region, GuestRIP);
-    if (Hit) {
-      DiskCacheHitRelocationsApplied = CodeCache.ApplyCodeRelocations(GuestRIP, std::as_writable_bytes(Hit->HostCode), Hit->Relocations, false);
-
-      if (DiskCacheHitRelocationsApplied && LoadDiskCacheCode) {
-        auto LoadedCode = Thread->CPUBackend->LoadCachedCode(Hit->HostCode, Hit->EntryPoints);
-        if (LoadedCode.BlockBegin) {
-
-          // annoying to unpack a different copy here, maybe better way to do this
-          fextl::set<uint64_t> EntryPoints;
-          for (auto [GuestOffset, HostAddr] : LoadedCode.EntryPoints) {
-            EntryPoints.insert(GuestOffset + Region->FileStartVA);
+    Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
+    if (Hit && !DiskCache.IsValidating()) {
+      auto LoadedCode = Thread->CPUBackend->LoadCachedCode(Hit->HostCode);
+      if (LoadedCode.BlockBegin) {
+        for (auto& CodePage : Hit->GuestPages) {
+          if (Thread->LookupCache->AddBlockExecutableRange(Thread, Hit->EntryPointRIPs, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
+            SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
           }
-          for (auto CodePage : Hit->GuestPages) {
-            if (Thread->LookupCache->AddBlockExecutableRange(Thread, EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
-              SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
-            }
-          }
-          for (auto [GuestOffset, HostAddr] : LoadedCode.EntryPoints) {
-            Thread->LookupCache->AddBlockMapping(Thread, GuestOffset + Region->FileStartVA, Hit->GuestPages, HostAddr);
-          }
-
-          uint64_t ModuleOffset = GuestRIP - Region->FileStartVA;
-          FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheHitCount, 1);
-          return reinterpret_cast<uintptr_t>(LoadedCode.EntryPoints[ModuleOffset]);
         }
+
+        LOGMAN_THROW_A_FMT(Hit->EntryPointRIPs.size() == Hit->EntryPointHostOffsets.size(), "Mismatched Disk Cache entrypoint pairs!");
+
+        uintptr_t CachedHostCode = 0;
+        for (size_t i = 0; i < Hit->EntryPointRIPs.size(); i++) {
+          void* HostAddr = LoadedCode.BlockBegin + Hit->EntryPointHostOffsets[i];
+          Thread->LookupCache->AddBlockMapping(Thread, Hit->EntryPointRIPs[i], Hit->GuestPages, HostAddr);
+          if (Hit->EntryPointRIPs[i] == GuestRIP) {
+            CachedHostCode = reinterpret_cast<uintptr_t>(HostAddr);
+          }
+        }
+
+        LOGMAN_THROW_A_FMT(CachedHostCode != 0, "Couldn't find GuestRIP in Disk Cache entrypoints!");
+
+        FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheHitCount, 1);
+        Thread->FrontendDecoder->DelayedDisownBuffer();
+
+        Thread->FrontendDecoder->ValidateDisownedOrFree();
+        Thread->OpDispatcher->ValidateDisownedOrFree();
+        return CachedHostCode;
       }
     }
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheMissCount, 1);
@@ -896,6 +919,10 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   } else if (!DebugData) {
     // DebugData wasn't populated, indicating another thread raced us for compiling this block
     return reinterpret_cast<uintptr_t>(CodePtr);
+  }
+
+  if (DiskCacheGuestCodeKey && Hit && DiskCache.IsValidating()) {
+    DiskCache.Validate(*DiskCacheGuestCodeKey, *Hit, CompiledCode, Region);
   }
 
   // if this ever fires, we need to serialize the offset into disk cache
@@ -956,16 +983,19 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
   // Disk Cache
-  if (Region && Region->FileStartVA != 0 && !CodeCache.IsGeneratingCache) {
-    std::span<const FEXCore::CPU::Relocation> Relocations;
-    if (DebugData && DebugData->Relocations) {
-      Relocations = *DebugData->Relocations;
+  if (!CodeCache.IsGeneratingCache) {
+    if (DiskCacheGuestCodeKey) {
+      std::span<const FEXCore::CPU::Relocation> Relocations;
+      if (DebugData && DebugData->Relocations) {
+        Relocations = *DebugData->Relocations;
+      }
+      std::span<const uint8_t> GuestCode = {reinterpret_cast<const uint8_t*>(StartAddr), Length};
+      const Frontend::Decoder::DecodedBlockInformation* BlockInfo =
+        NeedsAddGuestCodeRanges ? Thread->FrontendDecoder->GetDecodedBlockInfo() : nullptr;
+      DiskCache.Store(Thread, Region, GuestRIP, *DiskCacheGuestCodeKey, GuestCode, CompiledCode, Relocations, BlockInfo);
     }
-    std::span<const uint8_t> GuestCode = {reinterpret_cast<const uint8_t*>(StartAddr), Length};
-    const Frontend::Decoder::DecodedBlockInformation* BlockInfo = NeedsAddGuestCodeRanges ? Thread->FrontendDecoder->GetDecodedBlockInfo() : nullptr;
-    DiskCache.Store(Thread, *Region, GuestRIP, GuestCode, CompiledCode, Relocations, BlockInfo);
 
-    if (CodeMapWriter) {
+    if (CodeMapWriter && Region && Region->FileStartVA != 0) {
       CodeMapWriter->AppendBlock(*Region, GuestRIP);
     }
   }
@@ -980,6 +1010,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     Thread->CPUBackend->ClearRelocations();
   }
 
+  Thread->FrontendDecoder->ValidateDisownedOrFree();
+  Thread->OpDispatcher->ValidateDisownedOrFree();
+
   return (uintptr_t)CodePtr;
 }
 
@@ -992,6 +1025,7 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
 
+  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1);
   auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {

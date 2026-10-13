@@ -202,9 +202,10 @@ public:
     FlushRegisterCache();
     return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, InvalidNode, InvalidNode);
   }
-  IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock) {
+  IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock,
+                                         uint64_t PatchSiteAddress = 0, uint64_t PatchSiteSize = 0) {
     FlushRegisterCache();
-    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock);
+    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize);
   }
   IRPair<IROp_Break> Break(BreakDefinition Reason) {
     FlushRegisterCache();
@@ -360,8 +361,10 @@ public:
   void MOVGPRNTOp(OpcodeArgs);
   void MOVVectorAlignedOp(OpcodeArgs);
   void MOVVectorUnalignedOp(OpcodeArgs);
+  void MOVVectorUnalignedNoNopOp(OpcodeArgs);
   void MOVVectorNTOp(OpcodeArgs, bool IsAVX);
-  void ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::IR::IROps AtomicFetchOp, unsigned SrcIdx);
+  void ALURAXOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp);
+  void ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::IR::IROps AtomicFetchOp, unsigned SrcIdx, bool DestRAX);
   void LSLOp(OpcodeArgs);
   void INTOp(OpcodeArgs);
   void SyscallOp(OpcodeArgs, bool IsSyscallInst);
@@ -372,8 +375,8 @@ public:
   void IRETOp(OpcodeArgs);
   void CallbackReturnOp(OpcodeArgs);
   void SecondaryALUOp(OpcodeArgs);
-  void ADCOp(OpcodeArgs, uint32_t SrcIndex);
-  void SBBOp(OpcodeArgs, uint32_t SrcIndex);
+  void ADCOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
+  void SBBOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
   void SALCOp(OpcodeArgs);
   void PUSHOp(OpcodeArgs);
   void PUSHREGOp(OpcodeArgs);
@@ -393,16 +396,18 @@ public:
   void JUMPFARIndirectOp(OpcodeArgs);
   void CALLFARIndirectOp(OpcodeArgs);
   void RETFARIndirectOp(OpcodeArgs);
-  void TESTOp(OpcodeArgs, uint32_t SrcIndex);
+  void TESTOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
   void ARPLOp(OpcodeArgs);
   void MOVSXDOp(OpcodeArgs);
   void MOVSXOp(OpcodeArgs);
   void MOVZXOp(OpcodeArgs);
-  void CMPOp(OpcodeArgs, uint32_t SrcIndex);
+  void CMPOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
   void SETccOp(OpcodeArgs);
   void CQOOp(OpcodeArgs);
   void CDQOp(OpcodeArgs);
+  std::optional<Ref> XCHGOpImpl(OpcodeArgs, Ref Src);
   void XCHGOp(OpcodeArgs);
+  void XCHGRAXOp(OpcodeArgs);
   void SAHFOp(OpcodeArgs);
   void LAHFOp(OpcodeArgs);
   void MOVSegOp(OpcodeArgs, bool ToSeg);
@@ -424,11 +429,11 @@ public:
   void RotateOp(OpcodeArgs, bool Left, bool IsImmediate, bool Is1Bit);
   void RCROp1Bit(OpcodeArgs);
   void RCROp8x1Bit(OpcodeArgs);
-  void RCROp(OpcodeArgs);
-  void RCRSmallerOp(OpcodeArgs);
+  void RCROp(OpcodeArgs, bool UseRCX);
+  void RCRSmallerOp(OpcodeArgs, bool UseRCX);
   void RCLOp1Bit(OpcodeArgs);
-  void RCLOp(OpcodeArgs);
-  void RCLSmallerOp(OpcodeArgs);
+  void RCLOp(OpcodeArgs, bool UseRCX);
+  void RCLSmallerOp(OpcodeArgs, bool UseRCX);
 
   void BTOp(OpcodeArgs, uint32_t SrcIndex, enum BTAction Action);
 
@@ -663,6 +668,8 @@ public:
 
   void VPMADDUBSWOp(OpcodeArgs);
   void VPMADDWDOp(OpcodeArgs);
+  void VPDPBUSDOp(OpcodeArgs, bool Saturating);
+  void VPDPWSSDOp(OpcodeArgs, bool Saturating);
 
   void VPMASKMOVOp(OpcodeArgs, bool IsStore);
 
@@ -739,7 +746,7 @@ public:
   void X87FLDCW(OpcodeArgs);
   void X87FNSAVE(OpcodeArgs);
   void X87FNSTENV(OpcodeArgs);
-  void X87FNSTSW(OpcodeArgs);
+  void X87FNSTSW(OpcodeArgs, bool DestRAX);
   void X87FRSTOR(OpcodeArgs);
   void X87FSTCW(OpcodeArgs);
   void X87FXAM(OpcodeArgs);
@@ -799,6 +806,7 @@ public:
   void VPFCMPOp(OpcodeArgs, uint8_t CompType);
   void PI2FWOp(OpcodeArgs);
   void PF2IWOp(OpcodeArgs);
+  void PF2IDOp(OpcodeArgs);
 
   void PMULHRWOp(OpcodeArgs);
 
@@ -1033,6 +1041,9 @@ public:
 
   void AVX128_VPMADDUBSW(OpcodeArgs);
   void AVX128_VPMADDWD(OpcodeArgs);
+  void AVX128_VPDPImpl(OpcodeArgs, std::function<Ref(Ref Acc, Ref Src1, Ref Src2)> Helper);
+  void AVX128_VPDPBUSD(OpcodeArgs, bool Saturating);
+  void AVX128_VPDPWSSD(OpcodeArgs, bool Saturating);
 
   void AVX128_VBLEND(OpcodeArgs, IR::OpSize ElementSize);
 
@@ -1073,8 +1084,9 @@ public:
   void AVX128_VFMAScalarImpl(OpcodeArgs, IROps IROp, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
   void AVX128_VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
 
-  RefPair AVX128_VPGatherQPSImpl(OpcodeArgs, Ref Dest, Ref Mask, RefVSIB VSIB);
-  RefPair AVX128_VPGatherImpl(OpcodeArgs, OpSize Size, OpSize ElementLoadSize, OpSize AddrElementSize, RefPair Dest, RefPair Mask, RefVSIB VSIB);
+  RefPair AVX128_VPGatherQPSImpl(OpcodeArgs, Ref Dest, Ref Mask, RefVSIB VSIB, bool MaskAllOnes);
+  RefPair AVX128_VPGatherImpl(OpcodeArgs, OpSize Size, OpSize ElementLoadSize, OpSize AddrElementSize, RefPair Dest, RefPair Mask,
+                              RefVSIB VSIB, bool MaskAllOnesLow = false, bool MaskAllOnesHigh = false);
 
   void AVX128_VPGATHER(OpcodeArgs, OpSize AddrElementSize);
 
@@ -1167,6 +1179,11 @@ public:
     // At block boundaries, fix up the carry flag.
     if (!SRAOnly) {
       RectifyCarryInvert(CFInvertedABI);
+
+      // Also we can't trust the LastDef accross block boundaries, so clear that as well.
+      for (auto& Def : RegCache.LastDef) {
+        Def = nullptr;
+      }
     }
 
     if (!MMXOnly) {
@@ -1381,6 +1398,11 @@ private:
                     const X86Tables::DecodedOperand& Imm, bool IsAVX);
 
   void PCMPXSTRXOpImpl(OpcodeArgs, bool IsExplicit, bool IsMask, bool IsAVX);
+  Ref PCMPXSTRXSaturateExplicitLength(IR::OpSize ElementSize, IR::OpSize LengthSize, Ref RawLength);
+  Ref PCMPXSTRXEqualAny(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements);
+  Ref PCMPXSTRXRanges(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements, bool IsSigned);
+  Ref PCMPXSTRXEqualEach(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements);
+  Ref PCMPXSTRXEqualOrdered(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1Length, Ref Src2Length, Ref Src1ValidElements, Ref Indices);
 
   Ref PHADDSOpImpl(OpSize Size, Ref Src1, Ref Src2);
 
@@ -1396,6 +1418,10 @@ private:
   Ref PMADDWDOpImpl(IR::OpSize Size, Ref Src1, Ref Src2);
 
   Ref PMADDUBSWOpImpl(IR::OpSize Size, Ref Src1, Ref Src2);
+
+  Ref VPDPBUSDOpImpl(IR::OpSize Size, Ref Acc, Ref Src1, Ref Src2, bool Saturating);
+
+  Ref VPDPWSSDOpImpl(IR::OpSize Size, Ref Acc, Ref Src1, Ref Src2, bool Saturating);
 
   Ref PMULHRSWOpImpl(OpSize Size, Ref Src1, Ref Src2);
 
@@ -1498,6 +1524,20 @@ private:
   void StoreGPRRegister(uint32_t GPR, const Ref Src, IR::OpSize Size = OpSize::iInvalid, uint8_t Offset = 0);
   void StoreXMMRegister(uint32_t XMM, const Ref Src);
 
+  // Matches semantics around GPR storing that matches `StoreResult_WithOpSize` behaviour.
+  void StoreGPRResultWithZExtSemantics(uint32_t GPR, Ref Src, IR::OpSize OpSize) {
+    const auto GPRSize = GetGPROpSize();
+
+    if (GPRSize == OpSize::i64Bit && OpSize == OpSize::i32Bit) {
+      // If the Source IR op is 64 bits, we need to zext the upper bits
+      // For all other sizes, the upper bits are guaranteed to already be zero
+      Src = GetOpSize(Src) == OpSize::i64Bit ? ARef(Src).Bfe(0, 32).Ref() : Src;
+      StoreGPRRegister(GPR, Src, GPRSize);
+    } else {
+      StoreGPRRegister(GPR, Src, std::min(GPRSize, OpSize));
+    }
+  }
+
   Ref _GetRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset, bool Inline) {
     const auto GPRSize = GetGPROpSize();
     const auto Offs = Op->PC + Op->InstSize + Offset - Entry;
@@ -1508,18 +1548,24 @@ private:
     return _GetRelocatedPC(Op, Offset, false);
   }
 
-  void ExitRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset = 0) {
-    ExitFunction(_GetRelocatedPC(Op, Offset, true /* Inline */));
+  void ExitRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock) {
+    uint64_t PatchOffset = 0;
+    uint64_t PatchSize = 0;
+    if (Op->Src[0].IsLiteralPatchable() && Offset && Offset == (int64_t)Op->Src[0].Literal()) {
+      PatchOffset = Op->PC + Op->Src[0].Data.LiteralPatchable.FieldOffset;
+      PatchSize = Op->Src[0].Data.LiteralPatchable.Width;
+    }
+    ExitFunction(_GetRelocatedPC(Op, Offset, true /* Inline */), Hint, CallReturnAddress, CallReturnBlock, PatchOffset, PatchSize);
   }
 
-  void ExitRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock) {
-    ExitFunction(_GetRelocatedPC(Op, Offset, true /* Inline */), Hint, CallReturnAddress, CallReturnBlock);
+  void ExitRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset = 0) {
+    ExitRelocatedPC(Op, Offset, BranchHint::None, InvalidNode, InvalidNode);
   }
 
   [[nodiscard]]
   static bool IsOperandMem(const X86Tables::DecodedOperand& Operand, bool Load) {
     // Literals are immediates as sources but memory addresses as destinations.
-    return !(Load && (Operand.IsLiteral() || Operand.IsLiteralRelocation())) && !Operand.IsGPR();
+    return !(Load && (Operand.IsLiteral() || Operand.IsLiteralRelocation() || Operand.IsLiteralPatchable())) && !Operand.IsGPR();
   }
 
   [[nodiscard]]
@@ -1923,12 +1969,17 @@ private:
     uint64_t Partial;
 
     Ref Value[64];
+
+    // Keep track of where each register was last written to within the current block,
+    // for use in peephole optimizations.
+    Ref LastDef[64];
   } RegCache {};
 
   void InvalidateReg(uint8_t Index) {
     uint64_t Bit = (1ull << (uint64_t)Index);
     RegCache.Cached &= ~Bit;
     RegCache.Written &= ~Bit;
+    RegCache.LastDef[Index] = nullptr;
   }
 
   Ref LoadRegCache(uint64_t Offset, uint8_t Index, RegClass Class, IR::OpSize Size) {
@@ -2044,6 +2095,7 @@ private:
     RegCache.Value[Index] = Value;
     RegCache.Cached |= Bit;
     RegCache.Written |= Bit;
+    RegCache.LastDef[Index] = Value;
   }
 
   void InvalidateHighAVXRegisters() {

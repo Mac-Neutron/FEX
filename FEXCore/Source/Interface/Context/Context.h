@@ -4,13 +4,13 @@
 #include "Common/JitSymbols.h"
 #include "Interface/Core/CPUBackend.h"
 #include "Interface/Core/CPUID.h"
+#include "Interface/Core/DiskCache.h"
 #include "Interface/Core/SharedCodeBufferManager.h"
 #include <Interface/IR/IntrusiveIRList.h>
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/HostFeatures.h>
-#include <FEXCore/Core/DiskCache.h>
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
@@ -83,7 +83,6 @@ public:
   FEX_CONFIG_OPT(EnableLazyCodeCaching, ENABLELAZYCODECACHINGWIP);
   FEX_CONFIG_OPT(EnableCodeCacheValidation, ENABLECODECACHEVALIDATION);
 
-  uint64_t ComputeCodeMapId(std::string_view Filename, int FD) override;
   bool SaveData(Core::InternalThreadState&, int TargetFD, const ExecutableFileSectionInfo&, uint64_t SerializedBaseAddress) override;
 
   fextl::unique_ptr<MappedCodeCacheFile> LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo&, uint64_t FileStartVA) override;
@@ -128,6 +127,11 @@ public:
    */
   [[nodiscard]]
   bool ApplyCodeRelocations(uint64_t GuestDelta, std::span<std::byte> Code, std::span<const CPU::Relocation> Relocations, bool ForStorage);
+
+  // Same but on disk cache packed relocations
+  [[nodiscard]]
+  bool ApplyPackedCodeRelocations(uint64_t GuestDelta, std::span<std::byte> Code, std::span<const DiskCache::BlobSmallRelocation> SmallRelocs,
+                                  std::span<const DiskCache::BlobThunkRelocation> ThunkRelocs);
 };
 
 class ContextImpl final : public FEXCore::Context::Context, public CPU::SharedCodeBufferManager {
@@ -244,6 +248,9 @@ public:
   }
 
   void MarkMonoBackpatcherBlock(uint64_t BlockEntry) override;
+  std::atomic<uint64_t>& GetMonoBackPatcherBlock() {
+    return MonoBackpatcherBlock;
+  }
 
   // Manual debugging tooling which is useful for developers.
   struct TrackingEmpty {
@@ -361,9 +368,15 @@ public:
     FEX_CONFIG_OPT(DisableTelemetry, DISABLETELEMETRY);
     FEX_CONFIG_OPT(DisableVixlIndirectCalls, DISABLE_VIXL_INDIRECT_RUNTIME_CALLS);
     FEX_CONFIG_OPT(SmallTSCScale, SMALLTSCSCALE);
+    FEX_CONFIG_OPT(SoftwareRNG, SOFTWARERNG);
     FEX_CONFIG_OPT(StrictInProcessSplitLocks, STRICTINPROCESSSPLITLOCKS);
     FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
   } Config;
+
+  bool SoftwareRNGEnabled() const {
+    return Config.SoftwareRNG() && HostRNGAvailable;
+  }
+  bool HostRNGAvailable {};
 
   FEXCore::Utils::WritePriorityMutex::Mutex CodeInvalidationMutex {};
 

@@ -9,6 +9,7 @@ $end_info$
 #include "FEXCore/IR/IR.h"
 #include "Interface/Context/Context.h"
 #include "Interface/Core/JIT/JITClass.h"
+#include "Interface/Core/JIT/Relocations.h"
 #include "Interface/IR/Passes/RegisterAllocationPass.h"
 
 namespace FEXCore::CPU {
@@ -62,6 +63,21 @@ DEF_OP(EntrypointOffset) {
   }
 
   InsertGuestRIPMove(GetReg(Node), Constant & Mask);
+}
+
+DEF_OP(PatchableGuestData) {
+  auto Op = IROp->C<IR::IROp_PatchableGuestData>();
+  InsertGuestPatchableMove(RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE, GetReg(Node), Op->Value, Op->SiteAddress, (uint8_t)Op->SiteSize);
+}
+
+DEF_OP(PatchableGuestRIP) {
+  auto Op = IROp->C<IR::IROp_PatchableGuestRIP>();
+  InsertGuestPatchableMove(RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE, GetReg(Node), Op->Value, Op->SiteAddress, (uint8_t)Op->SiteSize);
+}
+
+DEF_OP(PatchableGuestCRC) {
+  auto Op = IROp->C<IR::IROp_PatchableGuestRIP>();
+  InsertGuestPatchableMove(RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE, GetReg(Node), Op->Value, Op->SiteAddress, (uint8_t)Op->SiteSize);
 }
 
 DEF_OP(InlineConstant) {

@@ -51,6 +51,7 @@ struct ExecutableFileInfo {
   uint64_t FileId = 0;
   fextl::string Filename;
   fextl::robin_map<uint32_t, GuestRelocationType> Relocations;
+  uint64_t MappedSize = 0;
 };
 
 // Information associated with a specific section of an executable file
@@ -233,14 +234,6 @@ class AbstractCodeCache {
 
 public:
   virtual ~AbstractCodeCache() = default;
-
-  /**
-   * Computes a unique identifier for the referenced binary file to be used for
-   * generating the code map.
-   * This identifier is independent of FEX build/runtime configuration and
-   * stable across FEX updates.
-   */
-  virtual uint64_t ComputeCodeMapId(std::string_view Filename, int FD) = 0;
 
   /**
    * Bundles the current Core state (CodeBuffer, GuestToHostMapping, ...) to a code cache and writes it to the given file descriptor.

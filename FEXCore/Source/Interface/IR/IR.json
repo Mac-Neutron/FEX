@@ -195,13 +195,13 @@
         "HasSideEffects": true
       },
 
-      "GPR = ValidateCode Array16:$CodeOriginal, GPR:$Address, u8:$CodeLength": {
+      "GPR = ValidateCode GPR:$crc, GPR:$Address, u8:$CodeLength": {
         "HasSideEffects": true,
         "HasDest": true,
         "DestSize": "OpSize::i64Bit"
       },
 
-      "ThreadRemoveCodeEntry": {
+      "ThreadRemoveCodeEntry GPR:$EntryToInvalidate, GPR:$NewRIP": {
         "HasSideEffects": true
       },
 
@@ -275,7 +275,8 @@
                  "The boolean argument asks if we should be reading the reseeded number or not",
                  "Reseeded RNG calculation is more expensive and will be heavier to use",
                  "Returns the 64-bit number",
-                 "Sets the Z flag if the number is valid.",
+                 "Falls back to a host RNG call when the hardware doesn't support it",
+                 "Sets the Z flag if the number is invalid.",
                  "RNG hardware is allowed to fail early and return. Software must always check this"
                 ],
         "HasSideEffects": true,
@@ -312,8 +313,8 @@
         "HasSideEffects": true,
         "RAOverride": "2"
       },
-      "ExitFunction OpSize:#Size, GPR:$NewRIP, BranchHint:$Hint, GPR:$CallReturnAddress, SSA:$CallReturnBlock": {
-        "Desc": ["Exits the current JIT function with a target RIP"
+      "ExitFunction OpSize:#Size, GPR:$NewRIP, BranchHint:$Hint, GPR:$CallReturnAddress, SSA:$CallReturnBlock, i64:$PatchSiteAddress{0}, i64:$PatchSiteSize{0}": {
+        "Desc": ["Exits the current JIT function with a target RIP - optionally patchable from guest bytes for caching"
                 ],
         "Inline": ["Any"],
         "HasSideEffects": true,
@@ -326,11 +327,10 @@
       "CallbackReturn": {
         "HasSideEffects": true
       },
-      "GPR = Syscall GPR:$SyscallID, GPR:$Arg0, GPR:$Arg1, GPR:$Arg2, GPR:$Arg3, GPR:$Arg4, GPR:$Arg5": {
+      "Syscall": {
         "HasSideEffects": true,
         "Desc": ["Dispatches a guest syscall through to the SyscallHandler class"
-                ],
-        "DestSize": "OpSize::i64Bit"
+                ]
       },
 
       "Thunk GPR:$ArgPtr, SHA256Sum:$ThunkNameHash": {
@@ -604,11 +604,12 @@
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize"
       },
-      "FPR = VLoadVectorGatherMasked OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Incoming, FPR:$Mask, GPR:$AddrBase, FPR:$VectorIndexLow, FPR:$VectorIndexHigh, OpSize:$VectorIndexElementSize, u8:$OffsetScale, u8:$DataElementOffsetStart, u8:$IndexElementOffsetStart, OpSize:$AddrSize": {
+      "FPR = VLoadVectorGatherMasked OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Incoming, FPR:$Mask, GPR:$AddrBase, FPR:$VectorIndexLow, FPR:$VectorIndexHigh, OpSize:$VectorIndexElementSize, u8:$OffsetScale, u8:$DataElementOffsetStart, u8:$IndexElementOffsetStart, OpSize:$AddrSize, i1:$MaskAllOnes{false}": {
         "Desc": [
           "Does a masked load similar to VPGATHERD* where the upper bit of each element",
           "determines whether or not that element will be loaded from memory.",
-          "Most of VSIB encoding is passed directly through to the IR operation."
+          "Most of VSIB encoding is passed directly through to the IR operation.",
+          "MaskAllOnes is set when every mask element is provably all ones."
         ],
         "TiedSource": 0,
         "ImplicitFlagClobber": true,
@@ -618,12 +619,13 @@
           "$VectorIndexElementSize == OpSize::i32Bit || $VectorIndexElementSize == OpSize::i64Bit"
         ]
       },
-      "FPR = VLoadVectorGatherMaskedQPS OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Incoming, FPR:$MaskReg, GPR:$AddrBase, FPR:$VectorIndexLow, FPR:$VectorIndexHigh, u8:$OffsetScale, OpSize:$AddrSize": {
+      "FPR = VLoadVectorGatherMaskedQPS OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Incoming, FPR:$MaskReg, GPR:$AddrBase, FPR:$VectorIndexLow, FPR:$VectorIndexHigh, u8:$OffsetScale, OpSize:$AddrSize, i1:$MaskAllOnes{false}": {
         "Desc": [
           "Does a masked load similar to VPGATHERQPS where the upper bit of each element",
           "determines whether or not that element will be loaded from memory.",
           "Most of VSIB encoding is passed directly through to the IR operation.",
-          "Only supports the case of 32-bit data element sizes from 64-bit addresses"
+          "Only supports the case of 32-bit data element sizes from 64-bit addresses",
+          "MaskAllOnes is set when every mask element is provably all ones."
         ],
         "TiedSource": 0,
         "ImplicitFlagClobber": true,
@@ -952,6 +954,27 @@
         "EmitValidation": [
           "Size == FEXCore::IR::OpSize::i32Bit || Size == FEXCore::IR::OpSize::i64Bit"
         ]
+      },
+
+      "GPR = PatchableGuestData OpSize:#Size, i64:$Value, i64:$SiteAddress, i64:$SiteSize": {
+        "Desc": ["Loads Value in a patchable way",
+                 "On disk cache load the value is patched from live guest bytes at SiteAddress"
+                ],
+        "DestSize": "Size"
+      },
+
+      "GPR = PatchableGuestRIP OpSize:#Size, i64:$Value, i64:$SiteAddress, i64:$SiteSize": {
+        "Desc": ["Loads GuestRIP-relative Value in a patchable way",
+                 "On disk cache load the value is patched from live guest PC and live displacement at SiteAddress"
+                ],
+        "DestSize": "Size"
+      },
+
+      "GPR = PatchableGuestCRC OpSize:#Size, i64:$Value, i64:$GuestAddress, i64:$GuestSize": {
+        "Desc": ["Loads Guest CRC in a patchable way",
+                 "On disk cache load the value is recomputed from live guest bytes and patched"
+                ],
+        "DestSize": "Size"
       },
 
       "GPR = Constant i64:$Constant, ConstPad:$Pad{IR::ConstPad::NoPad}, i32:$MaxBytes{0}": {
@@ -2037,6 +2060,30 @@
           "BitShift > 0 && BitShift <= IR::OpSizeAsBits(ElementSize)"
         ]
       },
+
+      "FPR = VRSHRN OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector, u8:$BitShift": {
+        "TiedSource": 0,
+        "Desc": ["Rounding shift right each element and then narrows to the next lower element size",
+                 "Writes result to the bottom half of the destination register, upper half is zeroed"
+                ],
+        "DestSize": "RegisterSize",
+        "ElementSize": "ElementSize >> 1",
+        "EmitValidation": [
+          "ElementSize >= FEXCore::IR::OpSize::i16Bit && ElementSize <= FEXCore::IR::OpSize::i64Bit",
+          "BitShift > 0 && BitShift <= IR::OpSizeAsBits(ElementSize)"
+        ]
+      },
+
+      "FPR = VRSHRNPair OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$VectorLower, FPR:$VectorUpper, u8:$BitShift": {
+        "Desc": ["Rounding shift right and narrow a pair of vectors into one result"],
+        "DestSize": "RegisterSize",
+        "ElementSize": "ElementSize >> 1",
+        "EmitValidation": [
+          "RegisterSize == FEXCore::IR::OpSize::i128Bit || RegisterSize == FEXCore::IR::OpSize::i256Bit",
+          "ElementSize >= FEXCore::IR::OpSize::i16Bit && ElementSize <= FEXCore::IR::OpSize::i64Bit",
+          "BitShift > 0 && BitShift <= IR::OpSizeAsBits(ElementSize)"
+        ]
+      },
       "FPR = VSXTL OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector": {
         "Desc": ["Sign extends elements from the source element size to the next size up"],
         "DestSize": "RegisterSize",
@@ -2333,6 +2380,43 @@
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize << 1"
       },
+      "FPR = VUSDot OpSize:#RegisterSize, FPR:$Acc, FPR:$Vector1, FPR:$Vector2": {
+        "Desc": ["Unsigned by signed 8-bit dot product, accumulating four products in to each 32-bit element of Acc.",
+                 "Requires FEAT_I8MM."
+                ],
+        "DestSize": "RegisterSize",
+        "ElementSize": "OpSize::i32Bit",
+        "TiedSource": 0,
+        "EmitValidation": [
+          "RegisterSize == FEXCore::IR::OpSize::i128Bit || RegisterSize == FEXCore::IR::OpSize::i256Bit"
+        ]
+      },
+      "FPR = VSDot OpSize:#RegisterSize, FPR:$Acc, FPR:$Vector1, FPR:$Vector2": {
+        "Desc": ["Signed 8-bit dot product, accumulating four products in to each 32-bit element of Acc.",
+                 "Requires FEAT_DotProd."
+                ],
+        "DestSize": "RegisterSize",
+        "ElementSize": "OpSize::i32Bit",
+        "TiedSource": 0,
+        "EmitValidation": [
+          "RegisterSize == FEXCore::IR::OpSize::i128Bit || RegisterSize == FEXCore::IR::OpSize::i256Bit"
+        ]
+      },
+      "FPR = VSAddLP OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector": {
+        "Desc": ["Signed add long pairwise. Adds adjacent pairs of elements in to elements of twice the size.",
+                 "ElementSize is the source size"
+                ],
+        "DestSize": "RegisterSize",
+        "ElementSize": "ElementSize << 1"
+      },
+      "FPR = VSAdALP OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Acc, FPR:$Vector": {
+        "Desc": ["Signed add and accumulate long pairwise. Adds adjacent pairs of elements in to the elements of Acc, which are twice the size.",
+                 "ElementSize is the source size"
+                ],
+        "DestSize": "RegisterSize",
+        "ElementSize": "ElementSize << 1",
+        "TiedSource": 0
+      },
       "FPR = VUMulH OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2": {
         "Desc": ["Wide unsigned multiply returning the high results"],
         "DestSize": "RegisterSize",
@@ -2436,6 +2520,14 @@
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize"
       },
+      "FPR = VUCMPGT OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2": {
+        "Desc": ["Vector compare unsigned greater than",
+                 "Each element is compared, if the result is true then the resulting element is ~0, else zero"
+                ],
+
+        "DestSize": "RegisterSize",
+        "ElementSize": "ElementSize"
+      },
       "FPR = VFCMPEQ OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2": {
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize"
@@ -2503,7 +2595,8 @@
       },
 
       "GPR = VPCMPESTRX FPR:$LHS, FPR:$RHS, GPR:$RAX, GPR:$RDX, u16:$Control": {
-        "Desc": ["Performs intermediate behavior analogous to the x86 PCMPESTRI/PCMPESTRM instruction",
+        "Desc": ["NOTE: Currently unused. The OpcodeDispatcher implements the SSE4.2 string instructions inline.",
+                 "Performs intermediate behavior analogous to the x86 PCMPESTRI/PCMPESTRM instruction",
                  "This will return the intermediate result of a PCMPESTR-type operation, but NOT the final",
                  "result. This must be derived from the intermediate result",
 
@@ -2515,7 +2608,8 @@
         "JITDispatch": false
       },
       "GPR = VPCMPISTRX FPR:$LHS, FPR:$RHS, u8:$Control": {
-        "Desc": ["Performs intermediate behavior analogous to the x86 PCMPISTRI/PCMPISTRM instruction",
+        "Desc": ["NOTE: Currently unused. The OpcodeDispatcher implements the SSE4.2 string instructions inline.",
+                 "Performs intermediate behavior analogous to the x86 PCMPISTRI/PCMPISTRM instruction",
                  "This will return the intermediate result of a PCMPISTR-type operation, but NOT the final",
                  "result. This must be derived from the intermediate result",
 
