@@ -11,6 +11,17 @@ $end_info$
 
 #include <FEXHeaderUtils/Syscalls.h>
 
+namespace {
+// Linux never maps the first 64 KiB (vm.mmap_min_addr), so a path pointer there can only fail with EFAULT. A ptrace
+// injector that redirects a stopped openat to dlopen leaves dlopen's flags (2, 0x102) in the path register; the kernel
+// answers EFAULT, where FEX's handlers would dereference the pointer and crash the process.
+// ponytail: only the never-mappable range; a mapped-but-unreadable pointer still faults in FEX (a fault-safe string probe
+// is the upgrade).
+inline bool IsUnmappableUserPointer(const void* Ptr) {
+  return reinterpret_cast<uintptr_t>(Ptr) < 0x10000;
+}
+} // namespace
+
 #include <fcntl.h>
 #include <stdint.h>
 #include <sys/file.h>
@@ -38,6 +49,9 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(open, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, int flags, uint32_t mode) -> uint64_t {
+    if (IsUnmappableUserPointer(pathname)) {
+      return -EFAULT;
+    }
     flags = FEX::HLE::RemapFromX86Flags(flags);
     uint64_t Result = FEX::HLE::_SyscallHandler->FM.Open(pathname, flags, mode);
     SYSCALL_ERRNO();
@@ -80,6 +94,9 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(openat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfs, const char* pathname, int flags, uint32_t mode) -> uint64_t {
+    if (IsUnmappableUserPointer(pathname)) {
+      return -EFAULT;
+    }
     flags = FEX::HLE::RemapFromX86Flags(flags);
     uint64_t Result = FEX::HLE::_SyscallHandler->FM.Openat(dirfs, pathname, flags, mode);
     SYSCALL_ERRNO();
@@ -102,6 +119,9 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
 
   REGISTER_SYSCALL_IMPL(
     openat2, [](FEXCore::Core::CpuStateFrame* Frame, int dirfs, const char* pathname, struct open_how* how, size_t usize) -> uint64_t {
+      if (IsUnmappableUserPointer(pathname)) {
+        return -EFAULT;
+      }
       open_how HostHow {};
       size_t HostSize = std::min(sizeof(open_how), usize);
       memcpy(&HostHow, how, HostSize);
