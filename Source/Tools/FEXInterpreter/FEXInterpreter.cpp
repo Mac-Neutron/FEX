@@ -266,6 +266,13 @@ bool QueryInterpreterInstalled(bool ExecutedWithFD, const FEX::Config::PortableI
 namespace FEX::Kernel {
 namespace TSO {
   void SetupTSOEmulation(FEXCore::Context::Context* CTX) {
+    FEX_CONFIG_OPT(HostTSO, HOSTTSO);
+    if (HostTSO()) {
+      // The host set TSO on every vCPU of this VM (nothing in the guest can switch it), so emulate nothing.
+      CTX->SetHardwareTSOSupport(true);
+      return;
+    }
+
     // Check to see if this is supported.
     auto Result = prctl(PR_GET_MEM_MODEL, 0, 0, 0, 0);
     if (Result == -1) {
