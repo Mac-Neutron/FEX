@@ -639,6 +639,15 @@
           "Highly likely to break any multithreaded application if disabled."
         ]
       },
+      "HostTSO": {
+        "Type": "bool",
+        "Default": "false",
+        "AffectsCodeGen": "true",
+        "Desc": [
+          "The host already runs this process with TSO memory ordering (a VM whose vCPUs have Apple's EnTSO set).",
+          "FEX then emits no ordering barriers."
+        ]
+      },
       "VectorTSOEnabled": {
         "Type": "bool",
         "Default": "false",
