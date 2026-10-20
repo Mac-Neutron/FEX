@@ -218,7 +218,10 @@ uint64_t SyscallHandler::write_ldt(FEXCore::Core::CpuStateFrame* Frame, void* pt
 
 namespace FEX::HLE::x64 {
 uint64_t SetThreadArea(FEXCore::Core::CpuStateFrame* Frame, void* tls) {
+  // CLONE_SETTLS: Linux sets the base through ARCH_SET_FS, which clears the selector; a selector the parent loaded
+  // (Wine's fs32_sel) must not make the child's set_thread_area reload its base.
   Frame->State.fs_cached = reinterpret_cast<uint64_t>(tls);
+  Frame->State.fs_idx = 0;
   return 0;
 }
 

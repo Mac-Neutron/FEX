@@ -1232,20 +1232,11 @@ void OpDispatchBuilder::FLAGControlOp(OpcodeArgs) {
 
 
 void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
-  // In x86-64 mode the accesses to the segment registers end up being constant zero moves
-  // Aside from FS/GS
-  // In x86-64 mode the accesses to segment registers can actually still touch the segments
-  // These write to the selector portion of the register
-  //
-  // FS and GS are specially handled here though
-  // AMD documentation is /wrong/ in this regard
-  // AMD documentation claims that the MOV to SReg and POP SReg registers will load a 32bit
-  // value in to the HIDDEN portions of the FS and GS registers /OR/ ignored if a null selector is
-  // selected for the registers
-  // This statement is actually untrue, the instructions will /actually/ load 16bits in to the selector portion of the register!
-  // Tested on a Zen+ CPU, the selector is the portion that is modified!
-  // We don't currently support FS/GS selector modifying, so this needs to be asserted out
-  // The loads here also load the selector, NOT the base
+  // A write stores the selector and loads its descriptor's base, in both modes. In 64-bit mode a non-null FS or GS
+  // selector loads the descriptor's 32-bit base, as the CPU does (Wine's new WoW64 loads its 32-bit TEB this way); a
+  // null selector loads base 0, as Intel CPUs do (AMD keeps the base). 64-bit code then sets a full 64-bit base with
+  // wrfsbase or arch_prctl.
+  // A read gives the selector, not the base.
 
   if (ToSeg) {
     Ref Src = LoadSourceGPR_WithOpSize(Op, Op->Src[0], OpSize::i16Bit, Op->Flags);
@@ -1278,23 +1269,13 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
       break;
     case FEXCore::X86State::REG_RBP: // GS
     case FEXCore::X86State::REG_R13: // GS
-      if (!Is64BitMode) {
-        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
-        UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
-      } else {
-        LogMan::Msg::EFmt("We don't support modifying GS selector in 64bit mode!");
-        DecodeFailure = true;
-      }
+      _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
+      UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
       break;
     case FEXCore::X86State::REG_RSP: // FS
     case FEXCore::X86State::REG_R12: // FS
-      if (!Is64BitMode) {
-        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
-        UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
-      } else {
-        LogMan::Msg::EFmt("We don't support modifying FS selector in 64bit mode!");
-        DecodeFailure = true;
-      }
+      _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
+      UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
       break;
     default: UnimplementedOp(Op); return;
     }
@@ -1320,19 +1301,11 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
       break;
     case FEXCore::X86State::REG_RBP: // GS
     case FEXCore::X86State::REG_R13: // GS
-      if (Is64BitMode) {
-        Segment = Constant(0);
-      } else {
-        Segment = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, gs_idx));
-      }
+      Segment = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, gs_idx));
       break;
     case FEXCore::X86State::REG_RSP: // FS
     case FEXCore::X86State::REG_R12: // FS
-      if (Is64BitMode) {
-        Segment = Constant(0);
-      } else {
-        Segment = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, fs_idx));
-      }
+      Segment = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, fs_idx));
       break;
     default: UnimplementedOp(Op); return;
     }
@@ -4366,11 +4339,12 @@ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg
   case FEXCore::X86Tables::DecodeFlags::FLAG_DS_PREFIX:
     _StoreContextGPR(OpSize::i32Bit, NewSegment, offsetof(FEXCore::Core::CPUState, ds_cached));
     break;
+  // FS and GS hold 64-bit bases: a selector load replaces all of it (the 32-bit result is zero-extended).
   case FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX:
-    _StoreContextGPR(OpSize::i32Bit, NewSegment, offsetof(FEXCore::Core::CPUState, fs_cached));
+    _StoreContextGPR(OpSize::i64Bit, NewSegment, offsetof(FEXCore::Core::CPUState, fs_cached));
     break;
   case FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX:
-    _StoreContextGPR(OpSize::i32Bit, NewSegment, offsetof(FEXCore::Core::CPUState, gs_cached));
+    _StoreContextGPR(OpSize::i64Bit, NewSegment, offsetof(FEXCore::Core::CPUState, gs_cached));
     break;
   default: break; // Do nothing
   }

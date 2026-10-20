@@ -524,6 +524,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
         return -EPERM;
       }
       Frame->State.gs_cached = addr;
+      Frame->State.gs_idx = 0; // as Linux: the selector no longer names the base
       Result = 0;
       break;
     case 0x1002: // ARCH_SET_FS
@@ -532,6 +533,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
         return -EPERM;
       }
       Frame->State.fs_cached = addr;
+      Frame->State.fs_idx = 0; // as Linux: the selector no longer names the base
       Result = 0;
       break;
     case 0x1003: // ARCH_GET_FS
