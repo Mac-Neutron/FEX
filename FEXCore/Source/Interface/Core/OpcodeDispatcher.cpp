@@ -385,11 +385,12 @@ void OpDispatchBuilder::PUSHSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
     case FEXCore::X86Tables::DecodeFlags::FLAG_DS_PREFIX:
       Src = _LoadContextGPR(SrcSize, offsetof(FEXCore::Core::CPUState, ds_cached));
       break;
+    // 64-bit code pushes the selector too (zero-extended), not the base: a 32-bit TEB's selector Wine loaded.
     case FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX:
-      Src = _LoadContextGPR(SrcSize, offsetof(FEXCore::Core::CPUState, fs_cached));
+      Src = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, fs_idx));
       break;
     case FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX:
-      Src = _LoadContextGPR(SrcSize, offsetof(FEXCore::Core::CPUState, gs_cached));
+      Src = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, gs_idx));
       break;
     default: FEX_UNREACHABLE;
     }

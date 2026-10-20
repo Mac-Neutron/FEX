@@ -549,9 +549,9 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
   guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_EFL] = eflags;
   // This stores the CS/GS/FS selectors. It ALSO stores the SS selector in the top 16 bits...For some reason.
   // Despite the naming, the endianness is swapped from what you'd expect.
+  // Linux writes 0 for GS and FS in a 64-bit frame (and never restores them from it), whatever they hold.
   guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_CSGSFS] =
-    ((uint64_t)Frame->State.ss_idx << 48) | ((uint64_t)Frame->State.fs_idx << 32) | ((uint64_t)Frame->State.gs_idx << 16) |
-    ((uint64_t)Frame->State.cs_idx << 0);
+    ((uint64_t)Frame->State.ss_idx << 48) | ((uint64_t)Frame->State.cs_idx << 0);
 
   // aarch64 and x86_64 siginfo_t matches. We can just copy this over
   // SI_USER could also potentially have random data in it, needs to be bit perfect
