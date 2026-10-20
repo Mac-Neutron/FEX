@@ -475,6 +475,9 @@ public:
   IRPair<IROp_CodeBlock> CreateNewCodeBlockAfter(Ref insertAfter);
   void SetCurrentCodeBlock(Ref Node);
 
+  // The GPR size of the block being built (its code segment's mode), for passes that compute guest addresses.
+  OpSize GuestGPRSize {OpSize::i64Bit};
+
 protected:
   void RemoveArgUses(Ref Node);
 

@@ -1763,8 +1763,11 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
 
   // Decode operating mode from thread's CS segment.
   const auto CSSegment = Core::CPUState::GetSegmentFromIndex(Thread->CurrentFrame->State, Thread->CurrentFrame->State.cs_idx);
+  // The mode is each block's: Wine's new WoW64 runs 32-bit code (cs 0x23) in a 64-bit process.
+  // ponytail: compiled blocks are looked up by RIP alone, so a RIP run in both modes would reuse the first mode's code
+  // (Wine's 32-bit and 64-bit code never share an address); the code cache (EnableCodeCachingWIP, off) assumes one
+  // mode. Key the lookup and the cache on the mode when a program needs both.
   BlockInfo.Is64BitMode = CSSegment->L == 1;
-  LOGMAN_THROW_A_FMT(BlockInfo.Is64BitMode == CTX->Config.Is64BitMode, "Expected operating mode to not change at runtime!");
 
   EntryPoint = PC;
   BlockInfo.EntryPoints = {PC};

@@ -161,7 +161,7 @@ public:
 
 private:
   const FEXCore::HostFeatures& Features;
-  const OpSize GPROpSize;
+  OpSize GPROpSize;
   bool ReducedPrecisionMode;
   FEX_CONFIG_OPT(DisableVixlIndirectCalls, DISABLE_VIXL_INDIRECT_RUNTIME_CALLS);
 
@@ -724,6 +724,8 @@ Ref X87StackOptimization::SynchronizeStackValues() {
 
 void X87StackOptimization::Run(IREmitter* Emit) {
   FEXCORE_PROFILE_SCOPED("PassManager::x87StackOpt");
+  // The block's own mode: a 32-bit block in a 64-bit process wraps its addresses at 4 GiB.
+  GPROpSize = Emit->GuestGPRSize;
 
   auto CurrentIR = Emit->ViewIR();
   auto* HeaderOp = CurrentIR.GetHeader();
