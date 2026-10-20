@@ -27,5 +27,6 @@ struct user_desc {
 };
 
 uint64_t SetThreadArea(FEXCore::Core::CpuStateFrame* Frame, void* tls);
+uint64_t GetThreadArea(FEXCore::Core::CpuStateFrame* Frame, void* tls);
 void AdjustRipForNewThread(FEXCore::Core::CpuStateFrame* Frame);
 } // namespace FEX::HLE::x32

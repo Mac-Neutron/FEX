@@ -97,6 +97,36 @@ uint64_t SetThreadArea(FEXCore::Core::CpuStateFrame* Frame, void* tls) {
   return 0;
 }
 
+uint64_t GetThreadArea(FEXCore::Core::CpuStateFrame* Frame, void* tls) {
+  struct x32::user_desc* u_info = reinterpret_cast<struct x32::user_desc*>(tls);
+  // Index to fetch comes from the user_desc
+  uint32_t Entry = u_info->entry_number;
+  if (Entry < TLS_NextEntry || Entry >= TLS_MaxEntry) {
+    return -EINVAL;
+  }
+
+  FaultSafeUserMemAccess::VerifyIsWritable(u_info, sizeof(*u_info));
+
+  const auto& GDT = &Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT][Entry];
+
+  memset(u_info, 0, sizeof(*u_info));
+
+  // FEX only stores base instead of the full GDT
+  u_info->base_addr = Frame->State.CalculateGDTBase(*GDT);
+
+  // Fill the rest of the structure with expected data (even if wrong at the moment)
+  if (u_info->base_addr) {
+    u_info->limit = 0xF'FFFF;
+    u_info->seg_32bit = 1;
+    u_info->limit_in_pages = 1;
+    u_info->useable = 1;
+  } else {
+    u_info->read_exec_only = 1;
+    u_info->seg_not_present = 1;
+  }
+  return 0;
+}
+
 void AdjustRipForNewThread(FEXCore::Core::CpuStateFrame* Frame) {
   Frame->State.rip += 2;
 }
@@ -151,34 +181,8 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL_X32(
     set_thread_area, [](FEXCore::Core::CpuStateFrame* Frame, struct user_desc* u_info) -> uint64_t { return SetThreadArea(Frame, u_info); });
 
-  REGISTER_SYSCALL_IMPL_X32(get_thread_area, [](FEXCore::Core::CpuStateFrame* Frame, struct user_desc* u_info) -> uint64_t {
-    // Index to fetch comes from the user_desc
-    uint32_t Entry = u_info->entry_number;
-    if (Entry < TLS_NextEntry || Entry >= TLS_MaxEntry) {
-      return -EINVAL;
-    }
-
-    FaultSafeUserMemAccess::VerifyIsWritable(u_info, sizeof(*u_info));
-
-    const auto& GDT = &Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT][Entry];
-
-    memset(u_info, 0, sizeof(*u_info));
-
-    // FEX only stores base instead of the full GDT
-    u_info->base_addr = Frame->State.CalculateGDTBase(*GDT);
-
-    // Fill the rest of the structure with expected data (even if wrong at the moment)
-    if (u_info->base_addr) {
-      u_info->limit = 0xF'FFFF;
-      u_info->seg_32bit = 1;
-      u_info->limit_in_pages = 1;
-      u_info->useable = 1;
-    } else {
-      u_info->read_exec_only = 1;
-      u_info->seg_not_present = 1;
-    }
-    return 0;
-  });
+  REGISTER_SYSCALL_IMPL_X32(
+    get_thread_area, [](FEXCore::Core::CpuStateFrame* Frame, struct user_desc* u_info) -> uint64_t { return GetThreadArea(Frame, u_info); });
 
   REGISTER_SYSCALL_IMPL_X32(set_robust_list, [](FEXCore::Core::CpuStateFrame* Frame, struct robust_list_head* head, size_t len) -> uint64_t {
     if (len != 12) {

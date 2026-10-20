@@ -21,6 +21,7 @@ $end_info$
 #include "LinuxSyscalls/Syscalls/Thread.h"
 #include "LinuxSyscalls/Utils/Threads.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
+#include "LinuxSyscalls/x32/Thread.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Types.h"
 #include "LinuxSyscalls/x64/Types.h"
@@ -948,7 +949,19 @@ void SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
   const auto Is64Bit = Is64BitMode();
 
   // TODO: At some point these will be runtime selectable based on `syscall` versus `int 0x80` entrypoint.
-  if (Is64Bit) {
+  // Done for one case: `int 0x80` (CD 80 at RIP) in a 64-bit process uses the i386 ABI, number in eax and first
+  // argument in ebx, and Linux answers it from its compat table.
+  // ponytail: only set_thread_area and get_thread_area, the two Wine's x86-64 WoW64 makes (alloc_fs_sel), and before
+  // any seccomp filter sees them; the x32 table and the filter when a program needs more.
+  // The legacy vsyscall page's code is FEX's own (Frontend's VSyscallData): its guest address isn't readable here.
+  const auto Inst = reinterpret_cast<const uint8_t*>(Frame->State.rip);
+  if (Is64Bit && Frame->State.rip < 0xFFFF'FFFF'FF60'0000ULL && Inst[0] == 0xCD && Inst[1] == 0x80) {
+    const auto Num = static_cast<uint32_t>(Frame->State.gregs[FEXCore::X86State::REG_RAX]);
+    const auto Arg = reinterpret_cast<void*>(static_cast<uint32_t>(Frame->State.gregs[FEXCore::X86State::REG_RBX]));
+    Frame->State.gregs[FEXCore::X86State::REG_RAX] = Num == 243 ? x32::SetThreadArea(Frame, Arg) :
+                                                     Num == 244 ? x32::GetThreadArea(Frame, Arg) :
+                                                                  -ENOSYS;
+  } else if (Is64Bit) {
     HandleSyscallImpl<true>(Frame, JITPC);
   } else {
     HandleSyscallImpl<false>(Frame, JITPC);

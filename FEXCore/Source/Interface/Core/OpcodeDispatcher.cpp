@@ -4925,12 +4925,8 @@ void OpDispatchBuilder::INTOp(OpcodeArgs) {
     if (CTX->HostFeatures.ProcessFeatures.HostType == FEXCore::HostFeatures::HostTypeEnum::Linux) {
       constexpr uint8_t SYSCALL_LITERAL = 0x80;
       if (Literal == SYSCALL_LITERAL) {
-        if (Is64BitMode) [[unlikely]] {
-          LogMan::Msg::EFmt("[Unsupported] Trying to execute 32-bit syscall from a 64-bit process.");
-          UnhandledOp(Op);
-          return;
-        }
-        // Syscall on linux
+        // Syscall on linux, from 64-bit code too (Wine's new WoW64 calls set_thread_area this way): the syscall
+        // handler tells it from `syscall` by the instruction at RIP.
         SyscallOp(Op, false);
         return;
       }
