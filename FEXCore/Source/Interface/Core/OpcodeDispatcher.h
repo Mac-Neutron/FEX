@@ -248,9 +248,10 @@ public:
 
   static bool CanHaveSideEffects(const FEXCore::X86Tables::X86InstInfo* TableInfo, FEXCore::X86Tables::DecodedOp Op) {
     if (TableInfo) {
-      if (TableInfo->Flags & X86Tables::InstFlags::FLAGS_DEBUG_MEM_ACCESS) {
+      if (TableInfo->Flags & (X86Tables::InstFlags::FLAGS_DEBUG_MEM_ACCESS | X86Tables::InstFlags::FLAGS_MEM_OFFSET)) {
         // If it is marked as having memory access then always say it has a side-effect.
         // Not always true but better to be safe.
+        // MOV's moffs forms (A0-A3) access memory through a literal operand, which the checks below don't count.
         return true;
       }
 
