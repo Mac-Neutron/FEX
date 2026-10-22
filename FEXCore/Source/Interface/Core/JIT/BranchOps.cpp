@@ -348,6 +348,12 @@ DEF_OP(ValidateCode) {
   const auto Dst = GetReg(Node);
   const auto CRC32Reg = GetReg(Op->crc);
 
+  if (!len) {
+    // Nothing to check: unchanged. (Comparing TMP1, never written below, made every run look modified.)
+    LoadConstant(ARMEmitter::Size::i32Bit, Dst, 0);
+    return;
+  }
+
   // Changes to TMP1
   auto WorkingReg = ARMEmitter::XReg::zr;
   auto BaseReg = TMP2;

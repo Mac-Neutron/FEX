@@ -640,11 +640,14 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
 
-          auto Value = FEXCore::Utils::crc32(ExistingCodePtr, DecodedInfo->InstSize);
+          // An invalid instruction decodes with no size: check its first byte at least, so that a protector rewriting the
+          // byte it planted (a nanomite) gets the new code, not the stale #UD.
+          const auto CheckSize = std::max<uint8_t>(DecodedInfo->InstSize, 1);
+          auto Value = FEXCore::Utils::crc32(ExistingCodePtr, CheckSize);
           auto CRC = WantsDiskCachePatching ?
-                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)ExistingCodePtr, DecodedInfo->InstSize) :
+                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)ExistingCodePtr, CheckSize) :
                        Thread->OpDispatcher->Constant(Value);
-          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, DecodedInfo->InstSize);
+          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, CheckSize);
 
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
 
