@@ -1255,12 +1255,12 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
       break;
     case FEXCore::X86State::REG_RCX: // CS
     case FEXCore::X86State::REG_R9:  // CS
-      // CPL3 can't write to this
+      // CPL3 can't write to this: MOV to CS is #UD, which Linux reports as SIGILL ILL_ILLOPN with trap 6.
       Break(FEXCore::IR::BreakDefinition {
         .ErrorRegister = 0,
         .Signal = SIGILL,
-        .TrapNumber = 0,
-        .si_code = 0,
+        .TrapNumber = X86State::X86_TRAPNO_UD,
+        .si_code = 2, ///< ILL_ILLOPN
       });
       break;
     case FEXCore::X86State::REG_RDX: // SS
@@ -5293,11 +5293,12 @@ void OpDispatchBuilder::PermissionRestrictedOp(OpcodeArgs) {
 }
 
 void OpDispatchBuilder::InvalidOp(OpcodeArgs) {
+  // #UD, as Linux reports it (do_error_trap): SIGILL ILL_ILLOPN with trap 6. Wine logs "unexpected trap" for trap 0.
   BreakOp(Op, FEXCore::IR::BreakDefinition {
                 .ErrorRegister = 0,
                 .Signal = SIGILL,
-                .TrapNumber = 0,
-                .si_code = 0,
+                .TrapNumber = X86State::X86_TRAPNO_UD,
+                .si_code = 2, ///< ILL_ILLOPN
               });
 }
 
