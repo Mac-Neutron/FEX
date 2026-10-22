@@ -451,6 +451,11 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                         }));
 
   REGISTER_SYSCALL_IMPL(exit, [](FEXCore::Core::CpuStateFrame* Frame, int status) -> uint64_t {
+    // No signal handler runs once a thread has called exit (Linux's do_exit). Block every signal before the teardown
+    // below frees the signal alt stack and the thread object: a signal landing in it ran FEX's handler on freed memory.
+    uint64_t AllSignals = ~0ULL;
+    ::syscall(SYS_rt_sigprocmask, SIG_BLOCK, &AllSignals, nullptr, sizeof(AllSignals));
+
     // TLS/DTV teardown is something FEX can't control. Disable glibc checking when we leave a pthread.
     // Since this thread is hard stopping, we can't track the TLS/DTV teardown in FEX's thread handling.
     FEXCore::Allocator::YesIKnowImNotSupposedToUseTheGlibcAllocator::HardDisable();
