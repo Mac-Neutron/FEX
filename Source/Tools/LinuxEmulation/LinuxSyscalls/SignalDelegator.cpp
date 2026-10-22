@@ -330,8 +330,13 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   // itself, so the ucontext RIP now differs from it: rt_sigreturn then takes the path that restores the handler's
   // registers and resumes at the ucontext RIP, instead of the path that resets to the interrupted state and re-runs
   // the syscall (discarding the handler's return value). See SeccompEmulator for the kernel semantics.
-  ContextBackup->SeccompTrapRIP = ThreadObject->SeccompTrapRIP;
-  ThreadObject->SeccompTrapRIP = 0;
+  // Only the SIGSYS queued for that syscall takes it. Another signal can arrive while QueueSignal is still making its
+  // syscalls (Wine's SIGUSR1 for NtSuspendThread, say): its handler must see the syscall instruction, so that its return
+  // resumes the queueing; entered past the syscall, it would resume there and the SIGSYS would never be sent.
+  const auto* SigInfo = static_cast<const siginfo_t*>(info);
+  if (Signal == SIGSYS && SigInfo->si_code > 0 && reinterpret_cast<uint64_t>(SigInfo->si_call_addr) == ThreadObject->SeccompTrapRIP) {
+    ContextBackup->SeccompTrapRIP = std::exchange(ThreadObject->SeccompTrapRIP, 0);
+  }
   ContextBackup->SavedJITStackSP = ThreadObject->JITStackSP;
 
   auto Frame = Thread->CurrentFrame;
@@ -965,25 +970,43 @@ void SignalDelegator::ForceGuestSigSegv(uint64_t BadSP) {
 
   // The guest handler must not run, and the disposition must not be re-read as the guest's action: otherwise the
   // re-raised SIGSEGV would re-enter SetupFrame_x64 with the same bad SP. force_sigsegv resets to SIG_DFL first.
-  SignalHandler& Handler = HostHandlers[SIGSEGV];
+  ForceExitSignal(SIGSEGV);
+}
+
+void SignalDelegator::ForceExitSignal(int Signal) {
+  // Linux force_exit_sig / force_sigsegv: whatever the guest's handler or mask, the process dies from Signal. The
+  // disposition goes to SIG_DFL first, so the guest handler never runs and raise() cannot re-enter FEX.
+  SignalHandler& Handler = HostHandlers[Signal];
   Handler.GuestAction.sigaction_handler.handler = SIG_DFL;
   Handler.OldAction.handler = SIG_DFL;
-  ::signal(SIGSEGV, SIG_DFL);
+  ::signal(Signal, SIG_DFL);
 
   CTX->FlushAndCloseCodeMap();
   FEX::HLE::_SyscallHandler->TM.CleanupForExit();
 
-  // Now die from SIGSEGV itself, so the parent sees a signal death (WTERMSIG == SIGSEGV), exactly as Linux reports
-  // force_sigsegv. The host disposition is SIG_DFL, so raise() cannot re-enter FEX. When the guest signal being set up
-  // is itself a SIGSEGV we are inside FEX's host SIGSEGV handler, where the kernel blocks SIGSEGV: unblock it, as
-  // force_sigsegv does, or the raise would stay pending and only this thread would exit.
-  uint64_t SegvMask = 1ULL << (SIGSEGV - 1);
-  ::syscall(SYS_rt_sigprocmask, SIG_UNBLOCK, &SegvMask, nullptr, 8);
-  ::raise(SIGSEGV);
+  // Now die from the signal itself, so the parent sees a signal death (WTERMSIG == Signal), exactly as Linux reports
+  // it. The signal may be blocked here (inside FEX's host SIGSEGV handler the kernel blocks SIGSEGV; a guest that
+  // blocked SIGSYS has it blocked on the host too): unblock it, or the raise would stay pending and only this thread
+  // would exit.
+  uint64_t Mask = 1ULL << (Signal - 1);
+  ::syscall(SYS_rt_sigprocmask, SIG_UNBLOCK, &Mask, nullptr, 8);
+  ::raise(Signal);
 
-  // Unreachable barring a blocked SIGSEGV: nothing has set up a guest frame to return into.
-  ::syscall(SYS_exit, 128 + SIGSEGV);
+  // Unreachable barring a blocked signal: nothing has set up a guest frame to return into.
+  ::syscall(SYS_exit, 128 + Signal);
   FEX_UNREACHABLE;
+}
+
+void SignalDelegator::ForceGuestSignal(FEX::HLE::ThreadStateObject* Thread, siginfo_t* Info) {
+  // Linux force_sig_info: a signal the guest has blocked or ignored can't be delivered, and the kernel then resets it
+  // to the default action, which kills the process.
+  const int Signal = Info->si_signo;
+  const bool Blocked = Thread->SignalInfo.CurrentSignalMask.Val & (1ULL << (Signal - 1));
+  const bool Ignored = HostHandlers[Signal].GuestAction.sigaction_handler.handler == SIG_IGN;
+  if (Blocked || Ignored) {
+    ForceExitSignal(Signal);
+  }
+  QueueSignal(::getpid(), FHU::Syscalls::gettid(), Signal, Info, true);
 }
 
 void SignalDelegator::QueueSignal(pid_t tgid, pid_t tid, int Signal, siginfo_t* info, bool IgnoreMask) {

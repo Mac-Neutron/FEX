@@ -131,6 +131,11 @@ public:
 
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) final override;
 
+  // Syscall user dispatch (prctl PR_SET_SYSCALL_USER_DISPATCH), as Linux 6.11's kernel/entry/syscall_user_dispatch.c.
+  uint64_t SetSyscallUserDispatch(FEXCore::Core::CpuStateFrame* Frame, uint64_t Mode, uint64_t Offset, uint64_t Len, uint64_t Selector);
+  // True when the syscall at Frame->State.rip was dispatched as a SIGSYS (or the process killed): it must not run.
+  bool CheckSyscallUserDispatch(FEXCore::Core::CpuStateFrame* Frame, bool Is64Bit);
+
   void DefaultProgramBreak(uint64_t Base, uint64_t Size);
   void DeserializeSeccompFD(FEX::HLE::ThreadStateObject* Thread, int FD) {
     if (FD == -1) {

@@ -26,6 +26,7 @@ $end_info$
 #include "LinuxSyscalls/x32/Types.h"
 #include "LinuxSyscalls/x64/Types.h"
 #include "Thunks.h"
+#include "VDSO_Emulation.h"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
@@ -62,6 +63,7 @@ $end_info$
 #include <system_error>
 #include <syscall.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <sys/utsname.h>
 #include <thread>
 #include <unistd.h>
@@ -943,10 +945,105 @@ void SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, uint
   SetResult(Frame, Result);
 }
 
+uint64_t SyscallHandler::SetSyscallUserDispatch(FEXCore::Core::CpuStateFrame* Frame, uint64_t Mode, uint64_t Offset, uint64_t Len,
+                                                uint64_t Selector) {
+  constexpr uint64_t DispatchOff = 0; // PR_SYS_DISPATCH_OFF
+  constexpr uint64_t DispatchOn = 1;  // PR_SYS_DISPATCH_ON
+  // x86-64 TASK_SIZE_MAX: access_ok() rejects a selector beyond it.
+  constexpr uint64_t TaskSizeMax = 0x7FFF'FFFF'F000ULL;
+
+  auto& Dispatch = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame)->SyscallUserDispatch;
+  switch (Mode) {
+  case DispatchOff:
+    if (Offset || Len || Selector) {
+      return -EINVAL;
+    }
+    Dispatch = {};
+    return 0;
+  case DispatchOn:
+    // A non-empty region that doesn't wrap; offset 0 skips the check, as in Linux.
+    if (Offset && Offset + Len <= Offset) {
+      return -EINVAL;
+    }
+    if (Selector && Selector + 1 > TaskSizeMax) {
+      return -EFAULT;
+    }
+    Dispatch = {.On = true, .Offset = Offset, .Len = Len, .Selector = Selector};
+    return 0;
+  default: return -EINVAL;
+  }
+}
+
+bool SyscallHandler::CheckSyscallUserDispatch(FEXCore::Core::CpuStateFrame* Frame, bool Is64Bit) {
+  auto Thread = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+  const auto& Dispatch = Thread->SyscallUserDispatch;
+  if (!Dispatch.On) {
+    return false;
+  }
+
+  // Linux checks the address after the instruction; `syscall` and `int 0x80` are both two bytes.
+  const uint64_t IP = Frame->State.rip + 2;
+
+  // The kernel lets a 32-bit vDSO sigreturn through (arch_syscall_is_vdso_sigreturn: the landing pad after its
+  // `int 0x80`). FEX's trampolines are those: `pop eax; mov eax, 0x77; int 0x80` and `mov eax, 0xad; int 0x80`.
+  if (!Is64Bit) {
+    const auto& VDSO = FEX::VDSO::GetVDSOSymbols();
+    if (IP == reinterpret_cast<uint64_t>(VDSO.VDSO_kernel_sigreturn) + 8 || IP == reinterpret_cast<uint64_t>(VDSO.VDSO_kernel_rt_sigreturn) + 7) {
+      return false;
+    }
+  }
+
+  if (IP - Dispatch.Offset < Dispatch.Len) {
+    return false;
+  }
+
+  if (Dispatch.Selector) {
+    // Linux's __get_user: an unreadable selector kills the process with SIGSEGV. CopyFromUser can't probe it (FEX dies
+    // on a fault inside it), process_vm_readv on ourselves reports the fault as an error instead.
+    // ponytail: one host syscall per out-of-range syscall while a selector is set; a resumable fault location in
+    // HandleFrontendSIGSEGV if it ever shows in a profile.
+    uint8_t State {};
+    iovec Local {&State, 1};
+    iovec Remote {reinterpret_cast<void*>(Dispatch.Selector), 1};
+    if (::process_vm_readv(::getpid(), &Local, 1, &Remote, 1, 0) != 1) {
+      SignalDelegation->ForceExitSignal(SIGSEGV);
+    }
+    if (State == 0) { // SYSCALL_DISPATCH_FILTER_ALLOW
+      return false;
+    }
+    if (State != 1) { // not SYSCALL_DISPATCH_FILTER_BLOCK
+      SignalDelegation->ForceExitSignal(SIGSYS);
+    }
+  }
+
+  // Dispatch: SIGSYS for the syscall, which doesn't run. RAX keeps its number, the handler's view of it (Linux rolls
+  // the syscall back the same way). The frame is entered at IP, see SeccompTrapRIP.
+  siginfo_t Info {
+    .si_signo = SIGSYS,
+    .si_errno = 0,
+    .si_code = 2, // SYS_USER_DISPATCH
+  };
+  Info.si_call_addr = reinterpret_cast<void*>(IP);
+  Info.si_syscall = static_cast<int>(Frame->State.gregs[FEXCore::X86State::REG_RAX]);
+  // ponytail: a 64-bit process's `int 0x80` reports AUDIT_ARCH_X86_64 here where Linux says AUDIT_ARCH_I386; check the
+  // instruction when a program cares.
+  Info.si_arch = Is64Bit ? AUDIT_ARCH_X86_64 : AUDIT_ARCH_I386;
+  Thread->SeccompTrapRIP = IP;
+  SignalDelegation->ForceGuestSignal(Thread, &Info);
+  return true;
+}
+
 void SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
   // Grab the return address which will be inside the JIT.
   const uint64_t JITPC = reinterpret_cast<uint64_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
   const auto Is64Bit = Is64BitMode();
+
+  // Syscall user dispatch comes first, as in Linux (before ptrace and seccomp), and covers every entry, `int 0x80` from
+  // 64-bit code included. A dispatched syscall returns before the RIP advance below: a handler that turns dispatch off
+  // and backs RIP up onto the syscall (Wine's fallback) then runs it again.
+  if (CheckSyscallUserDispatch(Frame, Is64Bit)) {
+    return;
+  }
 
   // TODO: At some point these will be runtime selectable based on `syscall` versus `int 0x80` entrypoint.
   // Done for one case: `int 0x80` (CD 80 at RIP) in a 64-bit process uses the i386 ABI, number in eax and first

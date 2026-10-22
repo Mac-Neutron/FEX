@@ -320,6 +320,8 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
     ThreadObject->ThreadInfo.PID = ::getpid();
     FEX::HLE::_SyscallHandler->FM.UpdatePID(ThreadObject->ThreadInfo.PID);
     ThreadObject->ThreadInfo.clear_child_tid = nullptr;
+    // Linux clears syscall user dispatch for every new task (dup_task_struct).
+    ThreadObject->SyscallUserDispatch = {};
 
     // only a  single thread running so no need to remove anything from the thread array
 
@@ -492,6 +494,12 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                             return FEX::HLE::_SyscallHandler->SeccompEmulator.Handle(Frame, Operation, 0, reinterpret_cast<void*>(arg3));
                           }
                           case PR_GET_SECCOMP: return FEX::HLE::_SyscallHandler->SeccompEmulator.GetSeccomp(Frame);
+#ifndef PR_SET_SYSCALL_USER_DISPATCH
+#define PR_SET_SYSCALL_USER_DISPATCH 59
+#endif
+                          // Emulated, never passed on: the host's would trap FEX's own syscalls.
+                          case PR_SET_SYSCALL_USER_DISPATCH:
+                            return FEX::HLE::_SyscallHandler->SetSyscallUserDispatch(Frame, arg2, arg3, arg4, arg5);
                           case PR_GET_AUXV: {
                             if (arg4 || arg5) {
                               return -EINVAL;

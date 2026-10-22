@@ -93,13 +93,23 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
   uint32_t SeccompMode {SECCOMP_MODE_DISABLED};
   fextl::vector<FEX::HLE::SeccompFilterInfo*> Filters {};
 
-  // Set to the address just past the syscall instruction when a SECCOMP_RET_TRAP has been queued for that syscall,
-  // zero otherwise. The next guest signal frame is entered with this address in its ucontext, the way Linux reports a
-  // seccomp trap for the instruction following the syscall. It is consumed by HandleDispatcherGuestSignal and
-  // deliberately differs from the CpuStateFrame's RIP at trap time (the syscall instruction itself), which is what
-  // makes rt_sigreturn take the path that restores the guest handler's registers. See the SECCOMP_RET_TRAP handling
-  // in SeccompEmulator for the Linux semantics this reproduces.
+  // Set to the address just past the syscall instruction when a SECCOMP_RET_TRAP or a syscall user dispatch has queued
+  // a SIGSYS for that syscall, zero otherwise. The next guest signal frame is entered with this address in its
+  // ucontext, the way Linux reports both for the instruction following the syscall. It is consumed by
+  // HandleDispatcherGuestSignal and deliberately differs from the CpuStateFrame's RIP at trap time (the syscall
+  // instruction itself), which is what makes rt_sigreturn take the path that restores the guest handler's registers.
+  // See the SECCOMP_RET_TRAP handling in SeccompEmulator for the Linux semantics this reproduces.
   uint64_t SeccompTrapRIP {};
+
+  // Syscall user dispatch (prctl PR_SET_SYSCALL_USER_DISPATCH), per thread as in Linux: a syscall whose address (just
+  // past the instruction) lies outside [Offset, Offset + Len) raises SIGSYS instead of running, unless the byte at
+  // Selector says ALLOW. A new thread or fork child starts with it off. See SyscallHandler::CheckSyscallUserDispatch.
+  struct {
+    bool On {};
+    uint64_t Offset {};
+    uint64_t Len {};
+    uint64_t Selector {};
+  } SyscallUserDispatch {};
 
   // Host stack pointer that guest code currently runs at when it is not the dispatcher's own level: a guest signal handler
   // entered from the C++ half of a syscall runs below that handler's frames. 0 means ReturningStackLocation. Lets rt_sigreturn

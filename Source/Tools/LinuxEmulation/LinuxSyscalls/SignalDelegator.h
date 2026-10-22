@@ -113,6 +113,12 @@ public:
   // offending address once, clean up, and die from SIGSEGV. Used when the guest signal frame cannot be written.
   [[noreturn]] void ForceGuestSigSegv(uint64_t BadSP);
 
+  // Linux force_exit_sig: the process dies from Signal, whatever the guest's handler or mask.
+  [[noreturn]] void ForceExitSignal(int Signal);
+  // Linux force_sig_info: queues Info's signal past the guest's mask, or kills the process with it when the guest
+  // blocked or ignored it.
+  void ForceGuestSignal(FEX::HLE::ThreadStateObject* Thread, siginfo_t* Info);
+
   void SetVDSOSymbols() {
     // Get symbols from VDSO.
     VDSOPointers = FEX::VDSO::GetVDSOSymbols();
