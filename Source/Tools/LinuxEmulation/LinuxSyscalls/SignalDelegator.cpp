@@ -917,11 +917,14 @@ bool SignalDelegator::UpdateHostThunk(int Signal) {
   // Walk the signals we have that are required and make sure to remove it from the mask
   // This'll likely be SIGILL, SIGBUS, SIG63
 
-  // If the guest has masked some signals then we need to also mask those signals
+  // Every other signal stays blocked while FEX's own handler code runs, not only the guest's sa_mask: that code is not
+  // reentrant. A guest signal landing in it (a SIGUSR1 during the host SIGILL that carries a guest rt_sigreturn, which
+  // Linux can't interrupt) was taken for interrupted C++ code and its frame written over the host signal stack in use.
+  // The guest handler still runs with the guest's mask: that one is the uc_sigmask FEX writes into the frame.
   for (size_t i = 1; i < HostHandlers.size(); ++i) {
     if (HostHandlers[i].Required.load(std::memory_order_relaxed)) {
       SignalHandler.HostAction.sa_mask &= ~(1ULL << (i - 1));
-    } else if (SigIsMember(&SignalHandler.GuestAction.sa_mask, i)) {
+    } else {
       SignalHandler.HostAction.sa_mask |= (1ULL << (i - 1));
     }
   }
