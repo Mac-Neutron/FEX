@@ -53,6 +53,10 @@ struct SignalDelegatorConfig {
   // SRA index mapping.
   SRAIndexMapping SRAGPRMapping;
   SRAIndexMapping SRAFPRMapping;
+
+  // Where the guest signal stubs (SIGILL, SIGTRAP, SIGSEGV) spill the static registers before they trap: [begin, end)
+  // each. Until a stub's spill ends, the guest registers are in the host registers, as in JIT code.
+  std::array<std::array<uint64_t, 2>, 3> GuestSignalSpillRanges {};
 };
 
 class SignalDelegator {

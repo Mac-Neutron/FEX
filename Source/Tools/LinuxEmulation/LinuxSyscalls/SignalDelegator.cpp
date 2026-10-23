@@ -25,6 +25,7 @@ $end_info$
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -267,6 +268,11 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
   if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_SYSCALLINFO_CLEARED) {
     // Back in the syscall handler the guest signal interrupted.
     Thread->CurrentFrame->InSyscallInfo = Context->ClearedSyscallInfo;
+  } else if (Type != RestoreType::TYPE_PAUSE) {
+    // A guest rt_sigreturn got here through the syscall dispatcher, which marked every register as spilled and clears
+    // that only when the syscall returns, which this one never does: the interrupted code's value comes back, or the
+    // next signal or SMC fault in JIT code would skip spilling the live registers and keep stale ones.
+    Thread->CurrentFrame->InSyscallInfo = Context->InSyscallInfo;
   }
 
   {
@@ -346,7 +352,14 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   ++Thread->CurrentFrame->SignalHandlerRefCounter;
 
   uint64_t OldPC = ArchHelpers::Context::GetPc(ucontext);
-  const bool WasInJIT = CTX->IsAddressInCodeBuffer(Thread, OldPC);
+  // A block raising a guest SIGILL/SIGTRAP/SIGSEGV branches to a dispatcher stub that spills the static registers and
+  // then traps. Until that spill ends the frame holds the registers of the last spill (an earlier signal's return, say)
+  // and the live ones are still in the host registers, as in JIT code: take them from there. The block has already
+  // asked for a fault to the top, so this signal's rt_sigreturn reloads the guest registers from its frame.
+  const bool InGuestSignalSpill = std::ranges::any_of(Config.GuestSignalSpillRanges, [OldPC](const auto& Range) {
+    return OldPC >= Range[0] && OldPC < Range[1];
+  });
+  const bool WasInJIT = CTX->IsAddressInCodeBuffer(Thread, OldPC) || InGuestSignalSpill;
 
   // Spill the SRA regardless of signal handler type
   // We are going to be returning to the top of the dispatcher which will fill again

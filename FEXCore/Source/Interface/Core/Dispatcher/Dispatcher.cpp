@@ -403,6 +403,7 @@ void Dispatcher::EmitDispatcher() {
     GuestSignal_SIGILL = GetCursorAddress<uint64_t>();
 
     SpillStaticRegs(TMP1);
+    GuestSignalSpillRanges[0] = {GuestSignal_SIGILL, GetCursorAddress<uint64_t>()};
 
     hlt(0);
   }
@@ -413,6 +414,7 @@ void Dispatcher::EmitDispatcher() {
     GuestSignal_SIGTRAP = GetCursorAddress<uint64_t>();
 
     SpillStaticRegs(TMP1);
+    GuestSignalSpillRanges[1] = {GuestSignal_SIGTRAP, GetCursorAddress<uint64_t>()};
 
     brk(0);
   }
@@ -423,6 +425,7 @@ void Dispatcher::EmitDispatcher() {
     GuestSignal_SIGSEGV = GetCursorAddress<uint64_t>();
 
     SpillStaticRegs(TMP1);
+    GuestSignalSpillRanges[2] = {GuestSignal_SIGSEGV, GetCursorAddress<uint64_t>()};
 
     // hlt/udf = SIGILL
     // brk = SIGTRAP
@@ -2750,6 +2753,8 @@ SignalDelegatorConfig Dispatcher::MakeSignalDelegatorConfig() const {
 
     .SRAGPRMapping = GetSRAGPRMapping(),
     .SRAFPRMapping = GetSRAFPRMapping(),
+
+    .GuestSignalSpillRanges = GuestSignalSpillRanges,
   };
 }
 
