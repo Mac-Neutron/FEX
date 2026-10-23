@@ -79,8 +79,10 @@ public:
   }
 
 private:
-  static constexpr size_t CounterSlots = 4096;
-  static constexpr size_t HotSlots = 2048;
+  // Sized for a large protected executable: Age of Empires II DE writes to ~2,900 of its code pages over and over, and
+  // with 2,048 hot slots (1,536 usable) the pages left out took 82% of its faults. 768 KiB per process.
+  static constexpr size_t CounterSlots = 65536;
+  static constexpr size_t HotSlots = 32768;
   static constexpr unsigned CountBits = 20;
   static constexpr uint64_t CountMask = (1ULL << CountBits) - 1;
   static_assert((CounterSlots & (CounterSlots - 1)) == 0 && (HotSlots & (HotSlots - 1)) == 0);
