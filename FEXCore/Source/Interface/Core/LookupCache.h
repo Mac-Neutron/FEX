@@ -91,6 +91,10 @@ struct GuestToHostMap {
 
   fextl::map<uint64_t, fextl::vector<uint64_t>> CodePages;
 
+  // The translations (their JITCodeHeader) covering each page, whose return points are patched when the page is invalidated.
+  // Found through the pages, not through BlockList: a later translation may have taken over a translation's entries.
+  fextl::map<uint64_t, fextl::vector<uint8_t*>> TranslationsByPage;
+
   GuestToHostMap();
 
   // Adds to Guest -> Host code mapping
@@ -129,6 +133,16 @@ struct GuestToHostMap {
   bool InvalidateRange(uint64_t Start, uint64_t Length) {
     auto lk = AcquireWriteLock();
 
+    // Threads may still hold return addresses into the range's translations on their call-return stacks
+    auto TranslationsLower = TranslationsByPage.lower_bound(Start >> 12);
+    auto TranslationsUpper = TranslationsByPage.upper_bound((Start + Length - 1) >> 12);
+    for (auto it = TranslationsLower; it != TranslationsUpper; it++) {
+      for (auto TranslationBegin : it->second) {
+        CPU::PatchDiscardedReturnPoints(TranslationBegin);
+      }
+    }
+    TranslationsByPage.erase(TranslationsLower, TranslationsUpper);
+
     auto lower = CodePages.lower_bound(Start >> 12);
     auto upper = CodePages.upper_bound((Start + Length - 1) >> 12);
 
@@ -147,13 +161,18 @@ struct GuestToHostMap {
     BlockLinks->insert({{GuestDestination, HostLink}, delinker});
   }
 
-  bool AddBlockExecutableRange(const std::ranges::input_range auto& Addresses, uint64_t Start, uint64_t Length, const LookupCacheWriteLockToken&) {
+  // TranslationBegin: the translation of Addresses, or null when unknown (the offline code cache's mappings)
+  bool AddBlockExecutableRange(const std::ranges::input_range auto& Addresses, uint64_t Start, uint64_t Length, uint8_t* TranslationBegin,
+                               const LookupCacheWriteLockToken&) {
     bool rv = false;
 
     for (auto CurrentPage = Start >> 12, EndPage = (Start + Length - 1) >> 12; CurrentPage <= EndPage; CurrentPage++) {
       auto& CodePage = CodePages[CurrentPage];
       rv |= CodePage.empty();
       CodePage.insert(CodePage.end(), Addresses.begin(), Addresses.end());
+      if (TranslationBegin) {
+        TranslationsByPage[CurrentPage].push_back(TranslationBegin);
+      }
     }
 
     return rv;
@@ -287,13 +306,14 @@ public:
 
   // Appends a list of Block {Address} to CodePages [Start, Start + Length)
   // Returns true if new pages are marked as containing code
-  bool AddBlockExecutableRange(FEXCore::Core::InternalThreadState* Thread, auto& Addresses, uint64_t Start, uint64_t Length) {
+  bool AddBlockExecutableRange(FEXCore::Core::InternalThreadState* Thread, auto& Addresses, uint64_t Start, uint64_t Length,
+                               uint8_t* TranslationBegin) {
     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
     auto lk = Shared->AcquireWriteLock();
     LockTime.reset();
 
-    return Shared->AddBlockExecutableRange(Addresses, Start, Length, lk);
+    return Shared->AddBlockExecutableRange(Addresses, Start, Length, TranslationBegin, lk);
   }
 
   // Adds to Guest -> Host code mapping

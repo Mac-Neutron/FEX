@@ -537,6 +537,30 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
   // No need to reset HostCode here as the exit linker pointer is stored separately, and if the block is relinked it will be updated.
 }
 
+void PatchDiscardedReturnPoints(uint8_t* TranslationBegin) {
+  const auto Header = reinterpret_cast<const CPUBackend::JITCodeHeader*>(TranslationBegin);
+  const auto Tail = reinterpret_cast<CPUBackend::JITCodeTail*>(TranslationBegin + Header->OffsetToBlockTail);
+  if (Tail->NumberOfReturnPoints == 0 ||
+      std::atomic_ref<uint8_t>(*ARMEmitter::DualMap::WriteAddr(&Tail->ReturnPointsPatched)).exchange(1, std::memory_order_relaxed)) {
+    return;
+  }
+
+  const auto Points = TranslationBegin + Tail->OffsetToReturnPoints;
+  for (uint32_t i = 0; i < Tail->NumberOfReturnPoints; ++i) {
+    uint32_t Offset;
+    memcpy(&Offset, Points + i * sizeof(uint32_t), sizeof(Offset));
+    const auto Point = reinterpret_cast<uintptr_t>(TranslationBegin + Offset);
+    const auto Stub = reinterpret_cast<uintptr_t>(TranslationBegin + Tail->OffsetToReturnStubs + i * 16);
+
+    uint32_t BranchInst = 0;
+    ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
+    BranchEmit.b(Stub / 4 - Point / 4);
+
+    std::atomic_ref<uint32_t>(*ARMEmitter::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(Point))).store(BranchInst, std::memory_order::relaxed);
+    ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(Point), 4);
+  }
+}
+
 uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
   auto Thread = Frame->Thread;
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
@@ -880,6 +904,8 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   JumpTargets.clear();
   CallReturnTargets.clear();
   PendingJumpThunks.clear();
+  PendingReturnPoints.clear();
+  ReturnBlockRIPs.clear();
   JumpTargets.resize(IR->GetHeader()->BlockCount, {});
   Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default()); // Discard any relocations generated from a previous attempt
 
@@ -958,6 +984,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
       if (BlockIROp->EntryPoint) {
         uint64_t BlockStartRIP = Entry + BlockIROp->GuestEntryOffset;
+        ReturnBlockRIPs[Node] = BlockStartRIP;
 
         const auto IsReturnTarget = CallReturnTargets.try_emplace(Node).first;
         if (PendingTargetLabel) {
@@ -1042,6 +1069,37 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   BindOrRestart(&l_ExitLink);
   PlaceNamedSymbolLiteral(InsertNamedSymbolLiteral(RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER));
 
+  // A stub per return point (PatchDiscardedReturnPoints): `ldr TMP1, <RIP>; b <common>; RIP`, 16 bytes; common stores the
+  // return block's guest RIP and exits to the dispatcher, as an exit with an unlinked RIP does.
+  fextl::vector<uint32_t> ReturnPointOffsets;
+  uint32_t ReturnStubsOffset = 0;
+  for (const auto& Point : PendingReturnPoints) {
+    if (ReturnBlockRIPs.contains(Point.ReturnBlock)) {
+      ReturnPointOffsets.push_back(Point.Location - reinterpret_cast<uint64_t>(CodeData.BlockBegin));
+    } else {
+      LOGMAN_MSG_A_FMT("Return block without an entry point");
+    }
+  }
+  if (!ReturnPointOffsets.empty()) {
+    Align(8);
+    ReturnStubsOffset = GetCursorAddress<uint8_t*>() - CodeData.BlockBegin;
+    ARMEmitter::ForwardLabel l_ReturnCommon;
+    for (const auto& Point : PendingReturnPoints) {
+      if (!ReturnBlockRIPs.contains(Point.ReturnBlock)) {
+        continue;
+      }
+      ARMEmitter::ForwardLabel l_RIP;
+      ldr(TMP1, &l_RIP);
+      b_OrRestart(&l_ReturnCommon);
+      BindOrRestart(&l_RIP);
+      PlaceNamedSymbolLiteral(InsertGuestRIPLiteral(ReturnBlockRIPs[Point.ReturnBlock]));
+    }
+    BindOrRestart(&l_ReturnCommon);
+    str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+    ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+    br(TMP2);
+  }
+
   // CodeSize not including the header or tail data.
   const uint64_t CodeOnlySize = GetCursorAddress<uint8_t*>() - CodeBegin;
 
@@ -1055,6 +1113,9 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     .GuestSize = Size,
     .SpinLockFutex = 0,
     .SingleInst = SingleInst,
+    .ReturnPointsPatched = 0,
+    .NumberOfReturnPoints = static_cast<uint32_t>(ReturnPointOffsets.size()),
+    .OffsetToReturnStubs = ReturnStubsOffset,
   };
 
   // Entries that live after the JITCodeTail.
@@ -1093,6 +1154,14 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       CurrentPCOffset = GuestOpcode.HostEntryOffset;
       CurrentRIPOffset = GuestOpcode.GuestEntryOffset;
     }
+  }
+
+  // The return points' offsets, after the RIP entries.
+  if (!ReturnPointOffsets.empty()) {
+    JITRIPEntriesLocation = reinterpret_cast<uint8_t*>(AlignUp(reinterpret_cast<uintptr_t>(JITRIPEntriesLocation), sizeof(uint32_t)));
+    JITBlockTail.OffsetToReturnPoints = JITRIPEntriesLocation - CodeData.BlockBegin;
+    memcpy(JITRIPEntriesLocation, ReturnPointOffsets.data(), ReturnPointOffsets.size() * sizeof(uint32_t));
+    JITRIPEntriesLocation += ReturnPointOffsets.size() * sizeof(uint32_t);
   }
 
   SetCursorOffset(JITRIPEntriesLocation - CodeData.BlockBegin);

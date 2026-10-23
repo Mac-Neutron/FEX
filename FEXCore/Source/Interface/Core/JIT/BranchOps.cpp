@@ -188,6 +188,9 @@ DEF_OP(ExitFunction) {
 
       EmitLinkedBranch(NewRIP, Op->Hint == IR::BranchHint::Call, Op->PatchSiteAddress, Op->PatchSiteSize);
       (void)Bind(&l_CallReturn);
+      if (Op->Hint == IR::BranchHint::Call && !Op->CallReturnBlock.IsInvalid()) {
+        PendingReturnPoints.push_back({GetCursorAddress<uint64_t>(), Op->CallReturnBlock.ID()});
+      }
 #ifdef ARCHITECTURE_arm64ec
     }
 #endif
@@ -251,6 +254,9 @@ DEF_OP(ExitFunction) {
       }
       blr(TMP2);
       (void)Bind(&l_CallReturn);
+      if (!Op->CallReturnBlock.IsInvalid()) {
+        PendingReturnPoints.push_back({GetCursorAddress<uint64_t>(), Op->CallReturnBlock.ID()});
+      }
     } else if (Op->Hint == IR::BranchHint::Return) {
       ret(TMP2);
     } else {

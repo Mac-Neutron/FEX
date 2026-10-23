@@ -95,7 +95,16 @@ namespace CPU {
       // If this block represents a single guest instruction.
       bool SingleInst;
 
-      uint8_t _Pad[3];
+      // Set once the return points have been patched (PatchDiscardedReturnPoints).
+      uint8_t ReturnPointsPatched;
+
+      uint8_t _Pad[2];
+
+      // The return points of calls that push a host return address (u32 offsets from the block's start, at
+      // OffsetToReturnPoints from it), and their stubs (16 bytes each, the first at OffsetToReturnStubs from the start).
+      uint32_t NumberOfReturnPoints;
+      uint32_t OffsetToReturnPoints;
+      uint32_t OffsetToReturnStubs;
     };
 
     /**
@@ -161,6 +170,18 @@ namespace CPU {
   private:
     void RegisterForSignalHandler(fextl::shared_ptr<CodeBuffer>);
   };
+
+  /**
+   * @brief Sends every return point of a discarded translation to the dispatcher
+   *
+   * A thread's call-return stack can hold host addresses inside a translation that an invalidation discarded (a thread
+   * that entered it through another thread's block link keeps its stack). Each return point is overwritten with a
+   * branch to its stub, which stores the return block's guest RIP and exits to the dispatcher. Done once per
+   * translation; called with the lookup map's write lock and the code invalidation mutex held.
+   *
+   * @param TranslationBegin - The translation's start (its JITCodeHeader)
+   */
+  void PatchDiscardedReturnPoints(uint8_t* TranslationBegin);
 
 } // namespace CPU
 } // namespace FEXCore

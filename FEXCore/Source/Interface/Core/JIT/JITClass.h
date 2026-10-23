@@ -111,6 +111,15 @@ private:
   };
   fextl::vector<PendingJumpThunk> PendingJumpThunks;
 
+  // The return points (l_CallReturn) of calls that push a host return address on the call-return stack. A discarded
+  // translation's are patched to branch to their stub, which exits to the dispatcher (PatchDiscardedReturnPoints).
+  struct PendingReturnPoint {
+    uint64_t Location;
+    IR::NodeID ReturnBlock;
+  };
+  fextl::vector<PendingReturnPoint> PendingReturnPoints;
+  fextl::map<IR::NodeID, uint64_t> ReturnBlockRIPs;
+
   Utils::PoolBufferWithTimedRetirement<uint8_t*, 5000, 500> TempCodeBufferAllocator;
 
   static uint64_t ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record);
