@@ -227,7 +227,14 @@ static void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
     SYSCALL_ERRNO();
   });
   REGISTER_SYSCALL_IMPL(write, [](FEXCore::Core::CpuStateFrame* Frame, int fd, const void* buf, size_t count) -> uint64_t {
+    off_t Off = -1;
+    if (PtraceEmu::HasActiveTracees() && fd > 2) {
+      Off = ::lseek(fd, 0, SEEK_CUR);
+    }
     uint64_t Result = ::syscall(SYSCALL_DEF(write), fd, buf, count);
+    if (Off >= 0 && static_cast<int64_t>(Result) > 0) {
+      PtraceEmu::NoteRemoteMemWrite(fd, static_cast<uint64_t>(Off), static_cast<int64_t>(Result));
+    }
     if (count == 16 && SigTrace::Enabled()) {
       const int Errno = errno;
       SigTrace::Log(::syscall(SYS_gettid), SigTrace::Write16, fd, Result, Result == 16 ? *static_cast<const uint64_t*>(buf) : (1ULL << 63) | Errno);
@@ -458,7 +465,13 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(ftruncate, SyscallPassthrough2<SYSCALL_DEF(ftruncate)>);
     REGISTER_SYSCALL_IMPL_X64(ioctl, SyscallPassthrough3<SYSCALL_DEF(ioctl)>);
     REGISTER_SYSCALL_IMPL_X64(pread_64, SyscallPassthrough4<SYSCALL_DEF(pread_64)>);
-    REGISTER_SYSCALL_IMPL_X64(pwrite_64, SyscallPassthrough4<SYSCALL_DEF(pwrite_64)>);
+    REGISTER_SYSCALL_IMPL_X64(pwrite_64, [](FEXCore::Core::CpuStateFrame* Frame, int fd, const void* buf, size_t count, off_t offset) -> uint64_t {
+      uint64_t Result = ::syscall(SYSCALL_DEF(pwrite_64), fd, buf, count, offset);
+      if (static_cast<int64_t>(Result) > 0) {
+        PtraceEmu::NoteRemoteMemWrite(fd, static_cast<uint64_t>(offset), static_cast<int64_t>(Result));
+      }
+      SYSCALL_ERRNO();
+    });
     REGISTER_SYSCALL_IMPL_X64(readv, SyscallPassthrough3<SYSCALL_DEF(readv)>);
     REGISTER_SYSCALL_IMPL_X64(writev, SyscallPassthrough3<SYSCALL_DEF(writev)>);
     REGISTER_SYSCALL_IMPL_X64(dup, SyscallPassthrough1<SYSCALL_DEF(dup)>);

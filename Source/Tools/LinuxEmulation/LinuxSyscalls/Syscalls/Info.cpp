@@ -97,15 +97,39 @@ void RegisterInfo(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(
     ptrace, [](FEXCore::Core::CpuStateFrame* Frame, int /*enum __ptrace_request*/ request, pid_t pid, void* addr, void* data) -> uint64_t {
       uint64_t Result {};
+      const bool Is32Bit = !FEX::HLE::_SyscallHandler->Is64BitMode();
 
       // Requests whose x86-64 view FEX has to emulate for a tracee that also runs under FEX (PtraceEmu.h).
-      if (PtraceEmu::HandleRequest(request, pid, addr, data, &Result)) {
+      if (PtraceEmu::HandleRequest(request, pid, addr, data, &Result, Is32Bit)) {
         return Result;
       }
 
       switch (request) {
       case PTRACE_PEEKTEXT:
       case PTRACE_PEEKDATA:
+        if (Is32Bit) {
+          uint64_t Value = 0;
+          Result = ::syscall(SYSCALL_DEF(ptrace), request, pid, addr, &Value);
+          if (Result == -1 && errno == EIO && (reinterpret_cast<uintptr_t>(addr) & 0xfff) > 0xff8 &&
+              (reinterpret_cast<uintptr_t>(addr) & 0xfff) <= 0xffc) {
+            // Avoid an 8-byte host read crossing into an unmapped next page when 4 bytes fit in the current page.
+            const uintptr_t Aligned = reinterpret_cast<uintptr_t>(addr) & ~7ULL;
+            const unsigned Shift = (reinterpret_cast<uintptr_t>(addr) & 7U) * 8U;
+            Result = ::syscall(SYSCALL_DEF(ptrace), request, pid, reinterpret_cast<void*>(Aligned), &Value);
+            if (Result != -1) {
+              Value >>= Shift;
+            }
+          }
+          if (Result != -1) {
+            if (!data) {
+              return -EFAULT;
+            }
+            FaultSafeUserMemAccess::VerifyIsWritable(data, sizeof(uint32_t));
+            *static_cast<uint32_t*>(data) = static_cast<uint32_t>(Value);
+          }
+          SYSCALL_ERRNO();
+        }
+        [[fallthrough]];
       case PTRACE_ATTACH:
         // Passthrough these requests. Allows Wine to run the Ubisoft launcher.
         Result = ::syscall(SYSCALL_DEF(ptrace), request, pid, addr, data);

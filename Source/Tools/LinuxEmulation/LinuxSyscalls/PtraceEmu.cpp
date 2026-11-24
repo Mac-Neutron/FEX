@@ -6,6 +6,7 @@ desc: Guest-visible ptrace emulation for x86-64 tracees that are themselves runn
 $end_info$
 */
 
+#include "ArchHelpers/UContext.h"
 #include "LinuxSyscalls/PtraceEmu.h"
 #include "LinuxSyscalls/Syscalls.h"
 
@@ -24,8 +25,10 @@ $end_info$
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -122,6 +125,16 @@ namespace {
   constexpr int X86_PTRACE_SETREGS = 13;
   constexpr int X86_PTRACE_EVENT_EXEC = 4;
 
+  // Layout of 32-bit `struct user_regs_struct` (17 x uint32_t) mapped to 64-bit `UserReg` slots,
+  // matching Linux `arch/x86/kernel/ptrace.c` `compat_arch_ptrace()`.
+  constexpr unsigned NumCompatUserRegs = 17;
+  constexpr UserReg CompatUserRegMap[NumCompatUserRegs] = {
+    Rbx, Rcx, Rdx, Rsi, Rdi, Rbp, Rax, Ds, Es, Fs, Gs, OrigRax, Rip, Cs, Eflags, Rsp, Ss,
+  };
+  constexpr uintptr_t CompatUserDebugRegByteOffset = 252;
+  constexpr uintptr_t CompatUserDebugRegByteEnd = CompatUserDebugRegByteOffset + 8 * sizeof(uint32_t); // 284
+  constexpr uintptr_t CompatUserStructSize = 284;
+
   SharedState StaticState {SharedState::MagicValue};
   SharedState* Current = &StaticState;
   thread_local uint64_t PendingRip = 0;
@@ -184,34 +197,39 @@ namespace {
   // Tracee side
   // ---------------------------------------------------------------------------------------------
 
-  // Builds the x86-64 user_regs_struct image of the guest at a syscall boundary.
-  void BuildRegs(const FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, bool Entry, uint64_t Ret, uint64_t* X) {
+  // Builds the x86-64 (or x86-32 in lower 32 bits) user_regs_struct image of the guest at a syscall boundary.
+  void BuildRegs(const FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, bool Entry, uint64_t Ret, uint64_t* X, bool Is64Bit = true) {
     using namespace FEXCore::X86State;
     const auto& S = Frame->State;
-    X[R15] = S.gregs[REG_R15];
-    X[R14] = S.gregs[REG_R14];
-    X[R13] = S.gregs[REG_R13];
-    X[R12] = S.gregs[REG_R12];
-    X[Rbp] = S.gregs[REG_RBP];
-    X[Rbx] = S.gregs[REG_RBX];
+    const uint64_t Mask = Is64Bit ? ~0ULL : 0xffffffffULL;
+    X[R15] = Is64Bit ? S.gregs[REG_R15] : 0;
+    X[R14] = Is64Bit ? S.gregs[REG_R14] : 0;
+    X[R13] = Is64Bit ? S.gregs[REG_R13] : 0;
+    X[R12] = Is64Bit ? S.gregs[REG_R12] : 0;
+    X[Rbp] = S.gregs[REG_RBP] & Mask;
+    X[Rbx] = S.gregs[REG_RBX] & Mask;
     X[R11] = UserFlags; // `syscall` leaves RFLAGS in r11
-    X[R10] = S.gregs[REG_R10];
-    X[R9] = S.gregs[REG_R9];
-    X[R8] = S.gregs[REG_R8];
-    X[Rax] = Entry ? static_cast<uint64_t>(-ENOSYS) : Ret;
-    X[Rcx] = S.gregs[REG_RCX];
-    X[Rdx] = S.gregs[REG_RDX];
-    X[Rsi] = S.gregs[REG_RSI];
-    X[Rdi] = S.gregs[REG_RDI];
-    X[OrigRax] = Nr;
-    X[Rip] = S.gregs[REG_RCX] ? S.gregs[REG_RCX] : S.rip; // `syscall` leaves the return address in rcx
-    X[Cs] = UserCodeSegment;
+    X[R10] = Is64Bit ? S.gregs[REG_R10] : 0;
+    X[R9] = Is64Bit ? S.gregs[REG_R9] : 0;
+    X[R8] = Is64Bit ? S.gregs[REG_R8] : 0;
+    X[Rax] = (Entry ? static_cast<uint64_t>(-ENOSYS) : Ret) & Mask;
+    X[Rcx] = S.gregs[REG_RCX] & Mask;
+    X[Rdx] = S.gregs[REG_RDX] & Mask;
+    X[Rsi] = S.gregs[REG_RSI] & Mask;
+    X[Rdi] = S.gregs[REG_RDI] & Mask;
+    X[OrigRax] = Nr & Mask;
+    // In 64-bit `syscall`, RCX holds return RIP; in 32-bit `int 0x80`, ECX is syscall arg1 and S.rip is `int 0x80`.
+    X[Rip] = Is64Bit ? (S.gregs[REG_RCX] ? S.gregs[REG_RCX] : S.rip) : ((S.rip + 2) & Mask);
+    X[Cs] = Is64Bit ? UserCodeSegment : 0x23U;
     X[Eflags] = UserFlags;
-    X[Rsp] = S.gregs[REG_RSP];
+    X[Rsp] = S.gregs[REG_RSP] & Mask;
     X[Ss] = UserStackSegment;
     X[FsBase] = S.fs_cached;
     X[GsBase] = S.gs_cached;
-    X[Ds] = X[Es] = X[Fs] = X[Gs] = 0;
+    X[Ds] = Is64Bit ? 0 : UserStackSegment;
+    X[Es] = Is64Bit ? 0 : UserStackSegment;
+    X[Fs] = Is64Bit ? 0 : S.fs_idx;
+    X[Gs] = Is64Bit ? 0 : S.gs_idx;
   }
 
   // Parks the tracee until the tracer resumes it. The host SIGSTOP is what the tracer's wait4() observes.
@@ -326,6 +344,7 @@ namespace {
   std::mutex RemotesLock;
   std::unordered_map<pid_t, Remote> Remotes;
   std::unordered_map<pid_t, std::string> ExePaths; // guest exe path of tracees that already exec()ed
+  std::atomic<bool> ActiveTracees {false};
 
   uintptr_t FindFexImageBase(pid_t Pid) {
     static const std::string SelfExe = []() {
@@ -379,6 +398,7 @@ namespace {
       }
       R.StaticAddr = TraceeBase + (reinterpret_cast<uintptr_t>(&StaticState) - SelfBase);
     }
+    ActiveTracees.store(true, std::memory_order_relaxed);
     return &Remotes.emplace(Pid, std::move(R)).first->second;
   }
 
@@ -417,6 +437,53 @@ namespace {
     return R == -1 ? static_cast<uint64_t>(-errno) : static_cast<uint64_t>(R);
   }
 
+  uint64_t HostPoke32(pid_t Pid, uintptr_t Base, uint32_t Val32) {
+    const unsigned Off = static_cast<unsigned>(Base & 7U);
+    if (Off <= 4) {
+      // All 4 bytes lie within the aligned 8-byte word, so this never crosses a page boundary.
+      const uintptr_t Aligned = Base & ~7ULL;
+      uint64_t Word = 0;
+      const uint64_t PeekRes = HostPtrace(PTRACE_PEEKDATA, Pid, reinterpret_cast<void*>(Aligned), &Word);
+      if (PeekRes != 0) {
+        return PeekRes;
+      }
+      const unsigned Shift = Off * 8U;
+      Word = (Word & ~(0xffffffffULL << Shift)) | (static_cast<uint64_t>(Val32) << Shift);
+      return HostPtrace(PTRACE_POKEDATA, Pid, reinterpret_cast<void*>(Aligned), reinterpret_cast<void*>(Word));
+    }
+    if ((Base & 0xfffU) <= 0xff8U) {
+      uint64_t Word = 0;
+      const uint64_t PeekRes = HostPtrace(PTRACE_PEEKDATA, Pid, reinterpret_cast<void*>(Base), &Word);
+      if (PeekRes != 0) {
+        return PeekRes;
+      }
+      Word = (Word & ~0xffffffffULL) | static_cast<uint64_t>(Val32);
+      return HostPtrace(PTRACE_POKEDATA, Pid, reinterpret_cast<void*>(Base), reinterpret_cast<void*>(Word));
+    }
+    const uintptr_t Aligned0 = Base & ~7ULL;
+    const uintptr_t Aligned1 = Aligned0 + 8;
+    uint64_t Word0 = 0, Word1 = 0;
+    uint64_t R = HostPtrace(PTRACE_PEEKDATA, Pid, reinterpret_cast<void*>(Aligned0), &Word0);
+    if (R != 0) {
+      return R;
+    }
+    R = HostPtrace(PTRACE_PEEKDATA, Pid, reinterpret_cast<void*>(Aligned1), &Word1);
+    if (R != 0) {
+      return R;
+    }
+    const unsigned LowBytes = 8U - Off;
+    const unsigned HighBytes = 4U - LowBytes;
+    const uint64_t LowMask = (1ULL << (LowBytes * 8U)) - 1ULL;
+    const uint64_t HighMask = (1ULL << (HighBytes * 8U)) - 1ULL;
+    Word0 = (Word0 & ~(LowMask << (Off * 8U))) | ((static_cast<uint64_t>(Val32) & LowMask) << (Off * 8U));
+    Word1 = (Word1 & ~HighMask) | (static_cast<uint64_t>(Val32) >> (LowBytes * 8U));
+    R = HostPtrace(PTRACE_POKEDATA, Pid, reinterpret_cast<void*>(Aligned0), reinterpret_cast<void*>(Word0));
+    if (R != 0) {
+      return R;
+    }
+    return HostPtrace(PTRACE_POKEDATA, Pid, reinterpret_cast<void*>(Aligned1), reinterpret_cast<void*>(Word1));
+  }
+
   bool ReadWord(pid_t Pid, size_t Offset, uint64_t* Out) {
     std::lock_guard lk(RemotesLock);
     Remote* R = Lookup(Pid);
@@ -447,6 +514,27 @@ namespace {
   bool IsFexTracee(pid_t Pid) {
     uint64_t Magic = 0;
     return ReadWord(Pid, offsetof(SharedState, Magic), &Magic) && Magic == SharedState::MagicValue;
+  }
+
+  void QueueRemoteFlush(pid_t Pid, uint64_t Addr, uint64_t Len) {
+    if (!Len || !IsFexTracee(Pid)) {
+      return;
+    }
+    const uint64_t Lo = Addr & ~0xfffULL;
+    const uint64_t Hi = (Addr + Len + 0xfffULL) & ~0xfffULL;
+    if (Hi <= Lo) {
+      return;
+    }
+    uint64_t OldAddr = 0, OldLen = 0;
+    ReadWord(Pid, offsetof(SharedState, FlushAddr), &OldAddr);
+    ReadWord(Pid, offsetof(SharedState, FlushLen), &OldLen);
+    uint64_t NewLo = Lo, NewHi = Hi;
+    if (OldLen) {
+      NewLo = std::min(OldAddr, Lo);
+      NewHi = std::max(OldAddr + OldLen, Hi);
+    }
+    WriteWord(Pid, offsetof(SharedState, FlushAddr), NewLo);
+    WriteWord(Pid, offsetof(SharedState, FlushLen), NewHi - NewLo);
   }
 
   bool ReadSlot(pid_t Pid, size_t Offset, uint64_t* Out) {
@@ -536,6 +624,10 @@ namespace {
 // Tracee side
 // -----------------------------------------------------------------------------------------------------
 
+void SetTraceeIs32Bit(bool Is32Bit) {
+  Current->TraceeIs32Bit = Is32Bit ? 1 : 0;
+}
+
 bool IsAttached() {
   return Current->Attached != 0;
 }
@@ -544,13 +636,14 @@ bool WantsSyscallStops() {
   return Current->SyscallStops && IsMainThread();
 }
 
-uint64_t SyscallEntryStop(FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, const uint64_t Args[6]) {
+uint64_t SyscallEntryStop(FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, const uint64_t Args[6], bool Is64Bit) {
+  Current->TraceeIs32Bit = Is64Bit ? 0 : 1;
   uint64_t Regs[NumUserRegs];
   if (Previous.Open) {
-    BuildRegs(Frame, Previous.Nr, false, 0, Regs);
+    BuildRegs(Frame, Previous.Nr, false, 0, Regs, Is64Bit);
     Stop(Previous.Nr, Previous.Args, false, 0, Regs);
   }
-  BuildRegs(Frame, Nr, true, 0, Regs);
+  BuildRegs(Frame, Nr, true, 0, Regs, Is64Bit);
   Stop(Nr, Args, true, 0, Regs);
   ApplyTracerWrites(Frame, true);
 
@@ -564,9 +657,10 @@ uint64_t SyscallEntryStop(FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, cons
   return NewNr;
 }
 
-uint64_t SyscallExitStop(FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, const uint64_t Args[6], uint64_t Result) {
+uint64_t SyscallExitStop(FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, const uint64_t Args[6], uint64_t Result, bool Is64Bit) {
+  Current->TraceeIs32Bit = Is64Bit ? 0 : 1;
   uint64_t Regs[NumUserRegs];
-  BuildRegs(Frame, Nr, false, Result, Regs);
+  BuildRegs(Frame, Nr, false, Result, Regs, Is64Bit);
   Stop(Nr, Args, false, Result, Regs);
   const uint64_t Override = ApplyTracerWrites(Frame, false);
   Previous.Open = false;
@@ -609,9 +703,10 @@ bool TryGuestSignalStop(FEXCore::Core::CpuStateFrame* Frame, int Signal) {
     return false;
   }
 
+  const bool Is64Bit = FEX::HLE::_SyscallHandler ? FEX::HLE::_SyscallHandler->Is64BitMode() : true;
   uint64_t Regs[NumUserRegs];
   const uint64_t NoArgs[6] {};
-  BuildRegs(Frame, ~0ULL, false, Frame->State.gregs[FEXCore::X86State::REG_RAX], Regs);
+  BuildRegs(Frame, ~0ULL, false, Frame->State.gregs[FEXCore::X86State::REG_RAX], Regs, Is64Bit);
   Regs[Rip] = Frame->State.rip; // for int3 FEX already points at the next instruction, which matches Linux
 
   Current->SignalNumber = static_cast<uint64_t>(Signal);
@@ -696,7 +791,7 @@ bool FixupWaitStatus(pid_t Pid, int* Status) {
   return false;
 }
 
-bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Result) {
+bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Result, bool Is32Bit) {
   switch (Request) {
   case PTRACE_TRACEME:
     *Result = HostPtrace(Request, Pid, Addr, Data);
@@ -705,6 +800,9 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
       // the common anti-debug probe) has no tracer that would ever remove the /dev/shm file again.
       PublishSharedPage();
       Current->Attached = 1;
+      if (FEX::HLE::_SyscallHandler) {
+        Current->TraceeIs32Bit = FEX::HLE::_SyscallHandler->Is64BitMode() ? 0 : 1;
+      }
     }
     return true;
 
@@ -712,27 +810,52 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
   case PTRACE_SEIZE:
   case PTRACE_INTERRUPT:
   case PTRACE_SETOPTIONS:
-  case PTRACE_GETEVENTMSG:
-  case PTRACE_SINGLESTEP:
-  case PTRACE_GETSIGINFO: *Result = HostPtrace(Request, Pid, Addr, Data); return true;
+  case PTRACE_SINGLESTEP: *Result = HostPtrace(Request, Pid, Addr, Data); return true;
+
+  case PTRACE_GETEVENTMSG: {
+    if (!Is32Bit) {
+      *Result = HostPtrace(Request, Pid, Addr, Data);
+      return true;
+    }
+    if (!Data) {
+      *Result = static_cast<uint64_t>(-EFAULT);
+      return true;
+    }
+    uint64_t Msg = 0;
+    *Result = HostPtrace(Request, Pid, Addr, &Msg);
+    if (*Result == 0) {
+      FaultSafeUserMemAccess::VerifyIsWritable(Data, sizeof(uint32_t));
+      *static_cast<uint32_t*>(Data) = static_cast<uint32_t>(Msg);
+    }
+    return true;
+  }
+
+  case PTRACE_GETSIGINFO: {
+    if (!Is32Bit) {
+      *Result = HostPtrace(Request, Pid, Addr, Data);
+      return true;
+    }
+    if (!Data) {
+      *Result = static_cast<uint64_t>(-EFAULT);
+      return true;
+    }
+    siginfo_t HostInfo {};
+    *Result = HostPtrace(Request, Pid, Addr, &HostInfo);
+    if (*Result == 0) {
+      FaultSafeUserMemAccess::VerifyIsWritable(Data, sizeof(FEXCore::x86::siginfo_t));
+      const FEXCore::x86::siginfo_t CompatInfo(HostInfo);
+      std::memcpy(Data, &CompatInfo, sizeof(CompatInfo));
+    }
+    return true;
+  }
 
   case PTRACE_POKETEXT:
   case PTRACE_POKEDATA: {
-    *Result = HostPtrace(Request, Pid, Addr, Data);
-    if (*Result == 0 && IsFexTracee(Pid)) {
+    *Result = Is32Bit ? HostPoke32(Pid, reinterpret_cast<uintptr_t>(Addr), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Data)))
+                      : HostPtrace(Request, Pid, Addr, Data);
+    if (*Result == 0) {
       // Remember the touched range so the tracee invalidates its translated code when it resumes.
-      const uint64_t Lo = reinterpret_cast<uint64_t>(Addr) & ~0xfffULL;
-      const uint64_t Hi = Lo + 0x2000;
-      uint64_t OldAddr = 0, OldLen = 0;
-      ReadWord(Pid, offsetof(SharedState, FlushAddr), &OldAddr);
-      ReadWord(Pid, offsetof(SharedState, FlushLen), &OldLen);
-      uint64_t NewLo = Lo, NewHi = Hi;
-      if (OldLen) {
-        NewLo = std::min(OldAddr, Lo);
-        NewHi = std::max(OldAddr + OldLen, Hi);
-      }
-      WriteWord(Pid, offsetof(SharedState, FlushAddr), NewLo);
-      WriteWord(Pid, offsetof(SharedState, FlushLen), NewHi - NewLo);
+      QueueRemoteFlush(Pid, reinterpret_cast<uint64_t>(Addr), 0x2000);
     }
     return true;
   }
@@ -762,6 +885,32 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
 
   case PTRACE_PEEKUSER: {
     const uintptr_t Off = reinterpret_cast<uintptr_t>(Addr);
+    if (Is32Bit) {
+      if ((Off % sizeof(uint32_t)) != 0 || Off >= CompatUserStructSize) {
+        *Result = static_cast<uint64_t>(-EIO);
+        return true;
+      }
+      if (!Data) {
+        *Result = static_cast<uint64_t>(-EFAULT);
+        return true;
+      }
+      uint64_t V = 0;
+      if (Off < NumCompatUserRegs * sizeof(uint32_t)) {
+        if (!ReadSlot(Pid, RegOffset(CompatUserRegMap[Off / sizeof(uint32_t)]), &V)) {
+          *Result = static_cast<uint64_t>(-ESRCH);
+          return true;
+        }
+      } else if (Off >= CompatUserDebugRegByteOffset && Off < CompatUserDebugRegByteEnd) {
+        if (!ReadDebugReg(Pid, static_cast<unsigned>((Off - CompatUserDebugRegByteOffset) / sizeof(uint32_t)), &V)) {
+          *Result = static_cast<uint64_t>(-ESRCH);
+          return true;
+        }
+      }
+      FaultSafeUserMemAccess::VerifyIsWritable(Data, sizeof(uint32_t));
+      *static_cast<uint32_t*>(Data) = static_cast<uint32_t>(V);
+      *Result = 0;
+      return true;
+    }
     // Mirror arch/x86/kernel/ptrace.c PTRACE_PEEKUSR: a slot-unaligned offset or one at/after sizeof(struct
     // user) is -EIO; the register image and the DR range are served; every other in-struct offset reads the
     // initialised 0.
@@ -788,6 +937,30 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
 
   case PTRACE_POKEUSER: {
     const uintptr_t Off = reinterpret_cast<uintptr_t>(Addr);
+    if (Is32Bit) {
+      const uint32_t Val32 = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Data));
+      if ((Off % sizeof(uint32_t)) != 0 || Off >= CompatUserStructSize) {
+        *Result = static_cast<uint64_t>(-EIO);
+        return true;
+      }
+      if (Off < NumCompatUserRegs * sizeof(uint32_t)) {
+        const unsigned Slot = CompatUserRegMap[Off / sizeof(uint32_t)];
+        if (!WriteWord(Pid, RegOffset(Slot), Val32)) {
+          *Result = static_cast<uint64_t>(-ESRCH);
+          return true;
+        }
+        MarkDirty(Pid, 1ULL << Slot);
+        *Result = 0;
+        return true;
+      }
+      if (Off >= CompatUserDebugRegByteOffset && Off < CompatUserDebugRegByteEnd) {
+        *Result = static_cast<uint64_t>(
+          WriteDebugReg(Pid, static_cast<unsigned>((Off - CompatUserDebugRegByteOffset) / sizeof(uint32_t)), Val32));
+        return true;
+      }
+      *Result = static_cast<uint64_t>(-EIO);
+      return true;
+    }
     // Mirror arch/x86/kernel/ptrace.c PTRACE_POKEUSR: a slot-unaligned offset or one at/after sizeof(struct
     // user) is -EIO; the register image is written; the DR range goes through ptrace_set_debugreg (which stores
     // DR0-DR3/DR6/DR7, rejects DR4/DR5 with -EIO and validates DR0-DR3 and DR7 with -EINVAL); every other
@@ -814,6 +987,24 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
   }
 
   case X86_PTRACE_GETREGS: {
+    if (Is32Bit) {
+      if (!Data) {
+        *Result = static_cast<uint64_t>(-EFAULT);
+        return true;
+      }
+      FaultSafeUserMemAccess::VerifyIsWritable(Data, NumCompatUserRegs * sizeof(uint32_t));
+      auto* Out = static_cast<uint32_t*>(Data);
+      for (unsigned i = 0; i < NumCompatUserRegs; ++i) {
+        uint64_t V = 0;
+        if (!ReadSlot(Pid, RegOffset(CompatUserRegMap[i]), &V)) {
+          *Result = static_cast<uint64_t>(-ESRCH);
+          return true;
+        }
+        Out[i] = static_cast<uint32_t>(V);
+      }
+      *Result = 0;
+      return true;
+    }
     for (unsigned i = 0; i < NumUserRegs; ++i) {
       uint64_t V = 0;
       if (!ReadSlot(Pid, RegOffset(i), &V)) {
@@ -827,6 +1018,26 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
   }
 
   case X86_PTRACE_SETREGS: {
+    if (Is32Bit) {
+      if (!Data) {
+        *Result = static_cast<uint64_t>(-EFAULT);
+        return true;
+      }
+      FaultSafeUserMemAccess::VerifyIsReadable(Data, NumCompatUserRegs * sizeof(uint32_t));
+      const auto* In = static_cast<const uint32_t*>(Data);
+      uint64_t Mask = 0;
+      for (unsigned i = 0; i < NumCompatUserRegs; ++i) {
+        const unsigned Slot = CompatUserRegMap[i];
+        if (!WriteWord(Pid, RegOffset(Slot), In[i])) {
+          *Result = static_cast<uint64_t>(-ESRCH);
+          return true;
+        }
+        Mask |= 1ULL << Slot;
+      }
+      MarkDirty(Pid, Mask);
+      *Result = 0;
+      return true;
+    }
     uint64_t Mask = 0;
     for (unsigned i = 0; i < NumUserRegs; ++i) {
       if (!WriteWord(Pid, RegOffset(i), static_cast<const uint64_t*>(Data)[i])) {
@@ -843,13 +1054,97 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
   case PTRACE_GETREGSET:
   case PTRACE_SETREGSET: {
     const auto NtType = reinterpret_cast<uintptr_t>(Addr);
-    auto* Iov = static_cast<struct iovec*>(Data);
-    if (!Iov) {
+    if (!Data) {
       return false;
     }
+    struct CompatIovec {
+      uint32_t iov_base;
+      uint32_t iov_len;
+    };
+    void* IovBase = nullptr;
+    size_t IovLen = 0;
+    if (Is32Bit) {
+      FaultSafeUserMemAccess::VerifyIsReadable(Data, sizeof(CompatIovec));
+      const auto* Iov32 = static_cast<const CompatIovec*>(Data);
+      IovBase = reinterpret_cast<void*>(static_cast<uintptr_t>(Iov32->iov_base));
+      IovLen = Iov32->iov_len;
+    } else {
+      FaultSafeUserMemAccess::VerifyIsReadable(Data, sizeof(struct iovec));
+      const auto* Iov64 = static_cast<const struct iovec*>(Data);
+      IovBase = Iov64->iov_base;
+      IovLen = Iov64->iov_len;
+    }
+    auto WriteBackLen = [&](size_t NewLen) {
+      if (Is32Bit) {
+        FaultSafeUserMemAccess::VerifyIsWritable(Data, sizeof(CompatIovec));
+        static_cast<CompatIovec*>(Data)->iov_len = static_cast<uint32_t>(NewLen);
+      } else {
+        FaultSafeUserMemAccess::VerifyIsWritable(Data, sizeof(struct iovec));
+        static_cast<struct iovec*>(Data)->iov_len = NewLen;
+      }
+    };
     const bool Get = Request == PTRACE_GETREGSET;
 
     if (NtType == NT_PRSTATUS) {
+      uint64_t TraceeIs32Val = 0;
+      if (!ReadSlot(Pid, offsetof(SharedState, TraceeIs32Bit), &TraceeIs32Val)) {
+        *Result = static_cast<uint64_t>(-ESRCH);
+        return true;
+      }
+      const bool TraceeIs32 = (TraceeIs32Val != 0);
+      if (TraceeIs32) {
+        if ((IovLen % sizeof(uint32_t)) != 0) {
+          *Result = static_cast<uint64_t>(-EINVAL);
+          return true;
+        }
+        if (Get) {
+          uint32_t Image32[NumCompatUserRegs];
+          for (unsigned i = 0; i < NumCompatUserRegs; ++i) {
+            uint64_t V = 0;
+            if (!ReadSlot(Pid, RegOffset(CompatUserRegMap[i]), &V)) {
+              *Result = static_cast<uint64_t>(-ESRCH);
+              return true;
+            }
+            Image32[i] = static_cast<uint32_t>(V);
+          }
+          const size_t Len = std::min(IovLen, sizeof(Image32));
+          if (Len) {
+            if (!IovBase) {
+              *Result = static_cast<uint64_t>(-EFAULT);
+              return true;
+            }
+            FaultSafeUserMemAccess::VerifyIsWritable(IovBase, Len);
+            std::memcpy(IovBase, Image32, Len);
+          }
+          WriteBackLen(Len);
+        } else {
+          const size_t Slots = std::min<size_t>(IovLen / sizeof(uint32_t), NumCompatUserRegs);
+          if (Slots) {
+            if (!IovBase) {
+              *Result = static_cast<uint64_t>(-EFAULT);
+              return true;
+            }
+            FaultSafeUserMemAccess::VerifyIsReadable(IovBase, Slots * sizeof(uint32_t));
+          }
+          uint64_t Mask = 0;
+          for (size_t i = 0; i < Slots; ++i) {
+            const unsigned Slot = CompatUserRegMap[i];
+            if (!WriteWord(Pid, RegOffset(Slot), static_cast<uint64_t>(static_cast<const uint32_t*>(IovBase)[i]))) {
+              *Result = static_cast<uint64_t>(-ESRCH);
+              return true;
+            }
+            Mask |= 1ULL << Slot;
+          }
+          MarkDirty(Pid, Mask);
+          WriteBackLen(Slots * sizeof(uint32_t));
+        }
+        *Result = 0;
+        return true;
+      }
+      if ((IovLen % sizeof(uint64_t)) != 0) {
+        *Result = static_cast<uint64_t>(-EINVAL);
+        return true;
+      }
       if (Get) {
         uint64_t Image[NumUserRegs];
         for (unsigned i = 0; i < NumUserRegs; ++i) {
@@ -858,21 +1153,35 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
             return true;
           }
         }
-        const size_t Len = std::min(Iov->iov_len, sizeof(Image));
-        std::memcpy(Iov->iov_base, Image, Len);
-        Iov->iov_len = Len;
+        const size_t Len = std::min(IovLen, sizeof(Image));
+        if (Len) {
+          if (!IovBase) {
+            *Result = static_cast<uint64_t>(-EFAULT);
+            return true;
+          }
+          FaultSafeUserMemAccess::VerifyIsWritable(IovBase, Len);
+          std::memcpy(IovBase, Image, Len);
+        }
+        WriteBackLen(Len);
       } else {
-        const size_t Slots = std::min<size_t>(Iov->iov_len / sizeof(uint64_t), NumUserRegs);
+        const size_t Slots = std::min<size_t>(IovLen / sizeof(uint64_t), NumUserRegs);
+        if (Slots) {
+          if (!IovBase) {
+            *Result = static_cast<uint64_t>(-EFAULT);
+            return true;
+          }
+          FaultSafeUserMemAccess::VerifyIsReadable(IovBase, Slots * sizeof(uint64_t));
+        }
         uint64_t Mask = 0;
         for (size_t i = 0; i < Slots; ++i) {
-          if (!WriteWord(Pid, RegOffset(i), static_cast<const uint64_t*>(Iov->iov_base)[i])) {
+          if (!WriteWord(Pid, RegOffset(i), static_cast<const uint64_t*>(IovBase)[i])) {
             *Result = static_cast<uint64_t>(-ESRCH);
             return true;
           }
           Mask |= 1ULL << i;
         }
         MarkDirty(Pid, Mask);
-        Iov->iov_len = NumUserRegs * sizeof(uint64_t);
+        WriteBackLen(Slots * sizeof(uint64_t));
       }
       *Result = 0;
       return true;
@@ -885,13 +1194,21 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
         *Result = static_cast<uint64_t>(-ESRCH);
         return true;
       }
-      const size_t Len = std::min(Iov->iov_len, R->FpRegs.size());
-      if (Get) {
-        std::memcpy(Iov->iov_base, R->FpRegs.data(), Len);
-      } else {
-        std::memcpy(R->FpRegs.data(), Iov->iov_base, Len);
+      const size_t Len = std::min(IovLen, R->FpRegs.size());
+      if (Len) {
+        if (!IovBase) {
+          *Result = static_cast<uint64_t>(-EFAULT);
+          return true;
+        }
+        if (Get) {
+          FaultSafeUserMemAccess::VerifyIsWritable(IovBase, Len);
+          std::memcpy(IovBase, R->FpRegs.data(), Len);
+        } else {
+          FaultSafeUserMemAccess::VerifyIsReadable(IovBase, Len);
+          std::memcpy(R->FpRegs.data(), IovBase, Len);
+        }
       }
-      Iov->iov_len = Len;
+      WriteBackLen(Len);
       *Result = 0;
       return true;
     }
@@ -905,13 +1222,21 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
         *Result = static_cast<uint64_t>(-ESRCH);
         return true;
       }
-      const size_t Len = std::min(Iov->iov_len, R->XState.size());
-      if (Get) {
-        std::memcpy(Iov->iov_base, R->XState.data(), Len);
-      } else {
-        std::memcpy(R->XState.data(), Iov->iov_base, Len);
+      const size_t Len = std::min(IovLen, R->XState.size());
+      if (Len) {
+        if (!IovBase) {
+          *Result = static_cast<uint64_t>(-EFAULT);
+          return true;
+        }
+        if (Get) {
+          FaultSafeUserMemAccess::VerifyIsWritable(IovBase, Len);
+          std::memcpy(IovBase, R->XState.data(), Len);
+        } else {
+          FaultSafeUserMemAccess::VerifyIsReadable(IovBase, Len);
+          std::memcpy(R->XState.data(), IovBase, Len);
+        }
       }
-      Iov->iov_len = Len;
+      WriteBackLen(Len);
       *Result = 0;
       return true;
     }
@@ -924,6 +1249,33 @@ bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Res
 
   default: return false;
   }
+}
+
+bool HasActiveTracees() {
+  return ActiveTracees.load(std::memory_order_relaxed);
+}
+
+void NoteRemoteMemWrite(int Fd, uint64_t Offset, int64_t Written) {
+  if (Written <= 0 || Fd < 0 || !HasActiveTracees()) {
+    return;
+  }
+  char FdLink[64];
+  std::snprintf(FdLink, sizeof(FdLink), "/proc/self/fd/%d", Fd);
+  char Target[128];
+  const ssize_t N = ::readlink(FdLink, Target, sizeof(Target) - 1);
+  if (N <= 0) {
+    return;
+  }
+  Target[N] = 0;
+  if (std::strncmp(Target, "/proc/", 6) != 0) {
+    return;
+  }
+  char* End = nullptr;
+  const long Pid = std::strtol(Target + 6, &End, 10);
+  if (End == Target + 6 || std::strcmp(End, "/mem") != 0 || Pid <= 0) {
+    return;
+  }
+  QueueRemoteFlush(static_cast<pid_t>(Pid), Offset, static_cast<uint64_t>(Written));
 }
 
 } // namespace FEX::HLE::PtraceEmu

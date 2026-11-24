@@ -5,6 +5,7 @@ tags: LinuxSyscalls|syscalls-x86-32
 $end_info$
 */
 
+#include "LinuxSyscalls/PtraceEmu.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x32/IoctlEmulation.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
@@ -29,6 +30,7 @@ x32SyscallHandler::x32SyscallHandler(FEXCore::Context::Context* ctx, FEX::HLE::S
                                      FEX::HLE::ThunkHandler* ThunkHandler, fextl::unique_ptr<MemAllocator> Allocator)
   : SyscallHandler {ctx, _SignalDelegation, ThunkHandler}
   , AllocHandler {std::move(Allocator)} {
+  PtraceEmu::SetTraceeIs32Bit(true);
   RegisterSyscallHandlers();
 }
 

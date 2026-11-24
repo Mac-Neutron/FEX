@@ -5,6 +5,7 @@ tags: LinuxSyscalls|syscalls-x86-32
 $end_info$
 */
 
+#include "LinuxSyscalls/PtraceEmu.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x32/IoctlEmulation.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
@@ -810,6 +811,9 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
     pwrite_64, [](FEXCore::Core::CpuStateFrame* Frame, int fd, void* buf, uint32_t count, uint32_t offset_low, uint32_t offset_high) -> uint64_t {
       uint64_t Offset = (uint64_t(offset_high) << 32) | offset_low;
       uint64_t Result = ::pwrite64(fd, buf, count, Offset);
+      if (static_cast<int64_t>(Result) > 0) {
+        PtraceEmu::NoteRemoteMemWrite(fd, Offset, static_cast<int64_t>(Result));
+      }
       SYSCALL_ERRNO();
     });
 

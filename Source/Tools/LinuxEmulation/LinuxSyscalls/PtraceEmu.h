@@ -72,6 +72,7 @@ struct SharedState {
   volatile uint64_t SignalNumber;      ///< Non-zero: the pending stop is a signal-delivery stop for this signal
   volatile uint64_t FlushAddr;         ///< The tracer wrote tracee memory: invalidate translated code here
   volatile uint64_t FlushLen;
+  volatile uint64_t TraceeIs32Bit;     ///< Non-zero when the tracee itself is running in 32-bit (x32) mode
   char ExePath[1024];                  ///< Guest path of the image the tracee is about to execve() (see RecordExecPath)
 };
 
@@ -79,14 +80,17 @@ struct SharedState {
 // Tracee side (the process that called PTRACE_TRACEME)
 // ---------------------------------------------------------------------------------------------------
 
+/// Records whether this process executes in 32-bit (x32) mode.
+void SetTraceeIs32Bit(bool Is32Bit);
+
 /// True while the tracer wants syscall stops and the calling thread is the tracee's main thread.
 bool WantsSyscallStops();
 
 /// Reports a syscall-entry stop. Returns the (possibly rewritten by the tracer) syscall number.
-uint64_t SyscallEntryStop(FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, const uint64_t Args[6]);
+uint64_t SyscallEntryStop(FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, const uint64_t Args[6], bool Is64Bit = true);
 
 /// Reports a syscall-exit stop. Returns the (possibly rewritten by the tracer) syscall result.
-uint64_t SyscallExitStop(FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, const uint64_t Args[6], uint64_t Result);
+uint64_t SyscallExitStop(FEXCore::Core::CpuStateFrame* Frame, uint64_t Nr, const uint64_t Args[6], uint64_t Result, bool Is64Bit = true);
 
 /// A fork-like clone just returned 0 in the child: leave state shared with the parent.
 void OnForkedChild(bool SharesAddressSpace);
@@ -115,7 +119,7 @@ bool IsAttached();
 
 /// Handles the ptrace requests whose x86-64 semantics FEX emulates. Returns true and fills *Result
 /// (a guest-style return value, negative errno on failure) if the request was handled.
-bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Result);
+bool HandleRequest(int Request, pid_t Pid, void* Addr, void* Data, uint64_t* Result, bool Is32Bit = false);
 
 /// Post-processes a wait4() result. Returns true if the stop was FEX-internal (host SIGSEGV/SIGTRAP of a
 /// tracee that FEX will handle itself) and the caller must wait again.
@@ -123,5 +127,9 @@ bool FixupWaitStatus(pid_t Pid, int* Status);
 
 /// Guest path of the binary a traced FEX process exec()ed, if known (for readlink of /proc/<pid>/exe).
 std::optional<std::string> TraceeExePath(pid_t Pid);
+
+/// Invalidates translated guest code in a tracee if `Fd` refers to `/proc/<pid>/mem`.
+void NoteRemoteMemWrite(int Fd, uint64_t Offset, int64_t Written);
+bool HasActiveTracees();
 
 } // namespace FEX::HLE::PtraceEmu

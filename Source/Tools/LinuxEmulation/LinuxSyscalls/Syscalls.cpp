@@ -876,20 +876,20 @@ void SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, uint
   auto SyscallNum = GetArg(Is64Bit, Frame, 0);
 
   // Emulated ptrace syscall stops: a tracer that resumed us with PTRACE_SYSCALL sees entry/exit stops with the
-  // x86-64 view of the syscall (see PtraceEmu.h).
+  // x86-64 (or compat i386 for x32 tracees) view of the syscall (see PtraceEmu.h).
   uint64_t TraceArgs[6] {};
-  const bool ReportStops = Is64Bit && PtraceEmu::WantsSyscallStops();
+  const bool ReportStops = PtraceEmu::WantsSyscallStops();
   if (ReportStops) {
     for (unsigned i = 0; i < 6; ++i) {
       TraceArgs[i] = GetArg(Is64Bit, Frame, i + 1);
     }
-    SyscallNum = PtraceEmu::SyscallEntryStop(Frame, SyscallNum, TraceArgs); // the tracer may have changed the syscall
+    SyscallNum = PtraceEmu::SyscallEntryStop(Frame, SyscallNum, TraceArgs, Is64Bit); // the tracer may have changed the syscall
   }
 
   if (SyscallNum >= Definitions.size()) {
     uint64_t Result = -ENOSYS;
     if (ReportStops && PtraceEmu::WantsSyscallStops()) {
-      Result = PtraceEmu::SyscallExitStop(Frame, SyscallNum, TraceArgs, Result);
+      Result = PtraceEmu::SyscallExitStop(Frame, SyscallNum, TraceArgs, Result, Is64Bit);
     }
     SetResult(Frame, Result);
     return;
@@ -925,22 +925,37 @@ void SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, uint
   Strace(Frame, Result);
 #endif
 
-  if constexpr (Is64Bit) {
-    PtraceEmu::ApplyPendingFlush(Frame);
-    // clone/fork/vfork/clone3 returned 0: this is the child. A forked child is not traced.
-    if (Result == 0 && (SyscallNum == 56 || SyscallNum == 57 || SyscallNum == 58 || SyscallNum == 435)) {
-      constexpr uint64_t CloneVM = 0x100;
-      uint64_t Flags = 0;
-      if (SyscallNum == 56) {
-        Flags = GetArg(Is64Bit, Frame, 1);
-      } else if (SyscallNum == 435) {
-        Flags = *reinterpret_cast<const uint64_t*>(GetArg(Is64Bit, Frame, 1)); // struct clone_args::flags
+  PtraceEmu::ApplyPendingFlush(Frame);
+  // clone/fork/vfork/clone3 returned 0: this is the child. A forked child is not traced.
+  if (Result == 0) {
+    constexpr uint64_t CloneVM = 0x100;
+    bool IsFork = false;
+    uint64_t Flags = 0;
+    if constexpr (Is64Bit) {
+      if (SyscallNum == 56 || SyscallNum == 57 || SyscallNum == 58 || SyscallNum == 435) {
+        IsFork = true;
+        if (SyscallNum == 56) {
+          Flags = GetArg(Is64Bit, Frame, 1);
+        } else if (SyscallNum == 435) {
+          Flags = *reinterpret_cast<const uint64_t*>(GetArg(Is64Bit, Frame, 1)); // struct clone_args::flags
+        }
       }
+    } else {
+      if (SyscallNum == 2 || SyscallNum == 120 || SyscallNum == 190 || SyscallNum == 435) {
+        IsFork = true;
+        if (SyscallNum == 120) {
+          Flags = GetArg(Is64Bit, Frame, 1);
+        } else if (SyscallNum == 435) {
+          Flags = *reinterpret_cast<const uint64_t*>(GetArg(Is64Bit, Frame, 1));
+        }
+      }
+    }
+    if (IsFork) {
       PtraceEmu::OnForkedChild((Flags & CloneVM) != 0);
     }
-    if (ReportStops && PtraceEmu::WantsSyscallStops()) {
-      Result = PtraceEmu::SyscallExitStop(Frame, SyscallNum, TraceArgs, Result);
-    }
+  }
+  if (ReportStops && PtraceEmu::WantsSyscallStops()) {
+    Result = PtraceEmu::SyscallExitStop(Frame, SyscallNum, TraceArgs, Result, Is64Bit);
   }
   SetResult(Frame, Result);
 }

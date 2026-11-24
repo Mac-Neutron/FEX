@@ -6,6 +6,7 @@ $end_info$
 */
 
 #include "ArchHelpers/UContext.h"
+#include "LinuxSyscalls/PtraceEmu.h"
 #include "LinuxSyscalls/SignalDelegator.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
@@ -169,8 +170,14 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
 
   REGISTER_SYSCALL_IMPL_X32(waitpid, [](FEXCore::Core::CpuStateFrame* Frame, pid_t pid, int32_t* status, int32_t options) -> uint64_t {
     FaultSafeUserMemAccess::VerifyIsWritableOrNull(status, sizeof(*status));
-    uint64_t Result = ::waitpid(pid, status, options);
-    SYSCALL_ERRNO();
+    int LocalStatus = 0;
+    int* StatusPtr = status ? status : &LocalStatus;
+    uint64_t Result;
+    do {
+      Result = ::waitpid(pid, StatusPtr, options);
+      Result = Result == -1 ? -errno : Result;
+    } while (static_cast<int64_t>(Result) > 0 && PtraceEmu::FixupWaitStatus(static_cast<pid_t>(Result), StatusPtr));
+    return Result;
   });
 
   REGISTER_SYSCALL_IMPL_X32(nice, [](FEXCore::Core::CpuStateFrame* Frame, int inc) -> uint64_t {
@@ -316,6 +323,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
     }));
 
   REGISTER_SYSCALL_IMPL_X32(wait4, [](FEXCore::Core::CpuStateFrame* Frame, pid_t pid, int* wstatus, int options, struct rusage_32* rusage) -> uint64_t {
+    FaultSafeUserMemAccess::VerifyIsWritableOrNull(wstatus, sizeof(*wstatus));
     struct rusage usage64 {};
     struct rusage* usage64_p {};
 
@@ -324,12 +332,18 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
       usage64 = *rusage;
       usage64_p = &usage64;
     }
-    uint64_t Result = ::wait4(pid, wstatus, options, usage64_p);
-    if (rusage) {
+    int LocalStatus = 0;
+    int* StatusPtr = wstatus ? wstatus : &LocalStatus;
+    uint64_t Result;
+    do {
+      Result = ::wait4(pid, StatusPtr, options, usage64_p);
+      Result = Result == -1 ? -errno : Result;
+    } while (static_cast<int64_t>(Result) > 0 && PtraceEmu::FixupWaitStatus(static_cast<pid_t>(Result), StatusPtr));
+    if (static_cast<int64_t>(Result) >= 0 && rusage) {
       FaultSafeUserMemAccess::VerifyIsWritable(rusage, sizeof(*rusage));
       *rusage = usage64;
     }
-    SYSCALL_ERRNO();
+    return Result;
   });
 
   REGISTER_SYSCALL_IMPL_X32(waitid,
@@ -338,22 +352,45 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                               struct rusage usage64 {};
                               struct rusage* usage64_p {};
 
-                              siginfo_t info64 {};
-                              siginfo_t* info64_p {};
-
                               if (rusage) {
                                 FaultSafeUserMemAccess::VerifyIsReadable(rusage, sizeof(*rusage));
                                 usage64 = *rusage;
                                 usage64_p = &usage64;
                               }
 
-                              if (info) {
-                                info64_p = &info64;
+                              siginfo_t info64 {};
+                              uint64_t Result;
+                              for (;;) {
+                                info64 = {};
+                                Result = ::syscall(SYSCALL_DEF(waitid), which, upid, &info64, options, usage64_p);
+                                Result = Result == -1 ? -errno : Result;
+                                if (static_cast<int64_t>(Result) < 0 || info64.si_pid <= 0) {
+                                  break;
+                                }
+                                int St = 0;
+                                const bool IsStopped = info64.si_code == CLD_STOPPED || info64.si_code == CLD_TRAPPED;
+                                if (info64.si_code == CLD_EXITED) {
+                                  St = (info64.si_status & 0xff) << 8;
+                                } else if (info64.si_code == CLD_KILLED || info64.si_code == CLD_DUMPED) {
+                                  St = (info64.si_status & 0x7f);
+                                } else if (IsStopped) {
+                                  St = (info64.si_status << 8) | 0x7f;
+                                } else {
+                                  break;
+                                }
+                                if (PtraceEmu::FixupWaitStatus(info64.si_pid, &St)) {
+                                  continue;
+                                }
+                                if (IsStopped) {
+                                  info64.si_status = St >> 8;
+                                  if ((St >> 8) != SIGSTOP) {
+                                    info64.si_code = CLD_TRAPPED;
+                                  }
+                                }
+                                break;
                               }
 
-                              uint64_t Result = ::syscall(SYSCALL_DEF(waitid), which, upid, info64_p, options, usage64_p);
-
-                              if (Result != -1) {
+                              if (static_cast<int64_t>(Result) >= 0) {
                                 if (rusage) {
                                   FaultSafeUserMemAccess::VerifyIsWritable(rusage, sizeof(*rusage));
                                   *rusage = usage64;
@@ -365,7 +402,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                                 }
                               }
 
-                              SYSCALL_ERRNO();
+                              return Result;
                             });
 }
 } // namespace FEX::HLE::x32
