@@ -82,13 +82,11 @@ private:
   uint64_t ThreadPauseHandlerAddress {};
   uint64_t ThreadPauseHandlerAddressSpillSRA {};
   uint64_t ThreadDispatchSyscallHandler {};
+  uint64_t ThreadDispatchCPUIDHandler {};
   uint64_t ThreadDispatchRemoveCodeEntry {};
   uint64_t ExitFunctionLinkerAddress {};
   uint64_t SignalHandlerReturnAddress {};
   uint64_t SignalHandlerReturnAddressRT {};
-  uint64_t GuestSignal_SIGILL {};
-  uint64_t GuestSignal_SIGTRAP {};
-  uint64_t GuestSignal_SIGSEGV {};
   uint64_t GuestSignal_SynchronousFault {};
   std::array<std::array<uint64_t, 2>, 3> GuestSignalSpillRanges {};
 

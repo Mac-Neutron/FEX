@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "CPUFeatures.h"
+#include "FEXUnixLib.h"
 
 namespace {
 
@@ -75,23 +76,18 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
     RegCloseKey(Key);
   }
 
-  FEX::FetchHostFeatures(Features, HostFeatures, !IsWine, CTR, MIDR);
+  FEX::FetchHostFeatures(Features, HostFeatures, IsWine, CTR, MIDR);
 
   // Force-disable SVE until wine/windows gain support for SVE context save/restore
-  HostFeatures.SupportsSVE128 = false;
-  HostFeatures.SupportsSVE256 = false;
+  HostFeatures.ProcessFeatures.SupportsSVE128 = false;
+  HostFeatures.ProcessFeatures.SupportsSVE256 = false;
 
-  HostFeatures.SupportsCPUIndexInTPIDRRO = !IsWine;
+  HostFeatures.SupportsCPUIndexInTPIDRRO = !IsWine || FEX::Windows::UnixLib::SupportsTPIDRRO_CPU();
 
   HostFeatures.ProcessPID = ProcessPID;
 
-  // AVX is unsupported for WOW64
-  HostFeatures.SupportsAVX = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
-
   HostFeatures.ProcessFeatures.HostType = HostType;
   HostFeatures.ProcessFeatures.Is64BitMode = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
-  // arm64ec supports synchronous faults without a double-fault dance.
-  HostFeatures.ProcessFeatures.SupportsFaultFreeSynchronousFaults = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
 
   return HostFeatures;
 }
@@ -133,6 +129,8 @@ CPUFeatures::CPUFeatures(FEXCore::Context::Context& CTX) {
   CpuInfo.ProcessorRevision = (FamilyIdentifier & 0xf0000) >> 4;                                // Extended Model
   CpuInfo.ProcessorRevision |= (FamilyIdentifier & 0xf0) << 4;                                  // Model
   CpuInfo.ProcessorRevision |= FamilyIdentifier & 0xf;                                          // Stepping
+  // 8-bits in CPUID 01.ebx for up to 256 cores.
+  CpuInfo.MaximumProcessors = ((CPUIDResult01.ebx >> 16) & 0xFF) + 1;
 }
 
 bool CPUFeatures::IsFeaturePresent(uint32_t Feature) {
@@ -165,6 +163,7 @@ bool CPUFeatures::IsFeaturePresent(uint32_t Feature) {
 }
 
 void CPUFeatures::UpdateInformation(SYSTEM_CPU_INFORMATION* Info) {
+  Info->MaximumProcessors = CpuInfo.MaximumProcessors;
   Info->ProcessorArchitecture = CpuInfo.ProcessorArchitecture;
   Info->ProcessorLevel = CpuInfo.ProcessorLevel;
   Info->ProcessorRevision = CpuInfo.ProcessorRevision;

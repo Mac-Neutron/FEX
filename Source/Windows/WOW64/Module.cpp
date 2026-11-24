@@ -115,10 +115,13 @@ WOW64_CONTEXT* GetWow64Context() {
 }
 
 struct FrontendThreadData {
+  FEX::Windows::ScopedHandle ThreadHandle;
+  EXCEPTION_RECORD TmpRecord {};
   bool InLockedRWXRead {};
   CHPE_V2_CPU_AREA_INFO CpuArea {};
 
-  FrontendThreadData(const TLS& TLS) {
+  FrontendThreadData(const TLS& TLS, FEX::Windows::ScopedHandle&& ThreadHandle)
+    : ThreadHandle {std::move(ThreadHandle)} {
     CpuArea.SuspendDoorbell = reinterpret_cast<ULONG*>(&TLS.ThreadState()->CurrentFrame->SuspendDoorbell);
     TLS.CpuArea() = &CpuArea;
   }
@@ -235,7 +238,14 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread) {
   // Floating-point register state
   const auto* XSave = reinterpret_cast<XSAVE_FORMAT*>(Context->ExtendedRegisters);
 
-  CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(XSave->XmmRegisters), nullptr);
+  const __uint128_t* Ymm = nullptr;
+  if ((Context->ContextFlags & CONTEXT_I386_XSTATE) == CONTEXT_I386_XSTATE) {
+    auto ContextEx = reinterpret_cast<CONTEXT_EX*>(Context + 1);
+    XSTATE* XState = reinterpret_cast<XSTATE*>(reinterpret_cast<char*>(ContextEx) + ContextEx->XState.Offset);
+    static const __uint128_t ZeroYmm[8] {};
+    Ymm = (XState->Mask & XSTATE_MASK_AVX) ? reinterpret_cast<__uint128_t*>(&XState->YmmContext) : ZeroYmm;
+  }
+  CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(XSave->XmmRegisters), Ymm);
   memcpy(State.mm, XSave->FloatRegisters, sizeof(State.mm));
 
   State.FCW = XSave->ControlWord;
@@ -246,6 +256,62 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread) {
   State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (XSave->StatusWord >> 14) & 1;
   State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (XSave->StatusWord >> 11) & 0b111;
   State.AbridgedFTW = XSave->TagWord;
+
+  // If any of the debug register state changed then we need to invalidate.
+  const bool Dr0Changed = (Context->Dr0 != State.Dr[0]) || ((Context->Dr7 ^ State.Dr7) & ((0b1111 << 16) | (0b11 << 0)));
+  const bool Dr1Changed = (Context->Dr1 != State.Dr[1]) || ((Context->Dr7 ^ State.Dr7) & ((0b1111 << 20) | (0b11 << 2)));
+  const bool Dr2Changed = (Context->Dr2 != State.Dr[2]) || ((Context->Dr7 ^ State.Dr7) & ((0b1111 << 24) | (0b11 << 4)));
+  const bool Dr3Changed = (Context->Dr3 != State.Dr[3]) || ((Context->Dr7 ^ State.Dr7) & ((0b1111 << 28) | (0b11 << 6)));
+
+  if (Dr0Changed || Dr1Changed || Dr2Changed || Dr3Changed) {
+    std::scoped_lock Lock(ThreadCreationMutex);
+    // Need to clear both context and state addresses if changed.
+    // Only if the BP type was instruction class.
+    if (Dr0Changed) {
+      if (Context->Dr0 && ((Context->Dr7 >> 16) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(Context->Dr0, 8, false);
+      }
+
+      if (State.Dr[0] && ((State.Dr7 >> 16) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(State.Dr[0], 8, false);
+      }
+    }
+    if (Dr1Changed) {
+      if (Context->Dr1 && ((Context->Dr7 >> 20) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(Context->Dr1, 8, false);
+      }
+
+      if (State.Dr[1] && ((State.Dr7 >> 20) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(State.Dr[1], 8, false);
+      }
+    }
+    if (Dr2Changed) {
+      if (Context->Dr2 && ((Context->Dr7 >> 24) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(Context->Dr2, 8, false);
+      }
+
+      if (State.Dr[2] && ((State.Dr7 >> 24) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(State.Dr[2], 8, false);
+      }
+    }
+    if (Dr3Changed) {
+      if (Context->Dr3 && ((Context->Dr7 >> 28) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(Context->Dr3, 8, false);
+      }
+
+      if (State.Dr[3] && ((State.Dr7 >> 28) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(State.Dr[3], 8, false);
+      }
+    }
+  }
+
+  // Update context now that we have invalidated.
+  State.Dr[0] = Context->Dr0;
+  State.Dr[1] = Context->Dr1;
+  State.Dr[2] = Context->Dr2;
+  State.Dr[3] = Context->Dr3;
+  State.Dr6 = Context->Dr6;
+  State.Dr7 = Context->Dr7;
 }
 
 void StoreWowContextFromState(WOW64_CONTEXT* Context) {
@@ -277,7 +343,14 @@ void StoreWowContextFromState(WOW64_CONTEXT* Context) {
 
   auto* XSave = reinterpret_cast<XSAVE_FORMAT*>(Context->ExtendedRegisters);
 
-  CTX->ReconstructXMMRegisters(Thread, reinterpret_cast<__uint128_t*>(XSave->XmmRegisters), nullptr);
+  __uint128_t* Ymm = nullptr;
+  if ((Context->ContextFlags & CONTEXT_I386_XSTATE) == CONTEXT_I386_XSTATE) {
+    auto ContextEx = reinterpret_cast<CONTEXT_EX*>(Context + 1);
+    XSTATE* XState = reinterpret_cast<XSTATE*>(reinterpret_cast<char*>(ContextEx) + ContextEx->XState.Offset);
+    XState->Mask = XSTATE_MASK_AVX;
+    Ymm = reinterpret_cast<__uint128_t*>(&XState->YmmContext);
+  }
+  CTX->ReconstructXMMRegisters(Thread, reinterpret_cast<__uint128_t*>(XSave->XmmRegisters), Ymm);
   memcpy(XSave->FloatRegisters, State.mm, sizeof(State.mm));
 
   XSave->ControlWord = State.FCW;
@@ -294,6 +367,14 @@ void StoreWowContextFromState(WOW64_CONTEXT* Context) {
   Context->FloatSave.DataOffset = XSave->DataOffset;
   Context->FloatSave.DataSelector = XSave->DataSelector;
   Context->FloatSave.Cr0NpxState = XSave->StatusWord | 0xffff0000;
+
+  // Save the debug register state to the context.
+  Context->Dr0 = State.Dr[0];
+  Context->Dr1 = State.Dr[1];
+  Context->Dr2 = State.Dr[2];
+  Context->Dr3 = State.Dr[3];
+  Context->Dr6 = State.Dr6;
+  Context->Dr7 = State.Dr7;
 }
 
 void FlushThreadStateContext() {
@@ -390,6 +471,42 @@ bool HandleSuspendInterrupt(CONTEXT* Context) {
 }
 } // namespace Context
 
+namespace Exception {
+static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const PEXCEPTION_RECORD Rec, WOW64_CONTEXT* GuestContext,
+                           FEXCore::Core::CpuStateFrame::SynchronousFaultDataStruct& Fault) {
+  auto FrontendData = GetFrontendThreadData(Thread);
+  BOOL FirstChance = TRUE;
+
+  // Needs to be stored in not a stack-variable otherwise WINE can overwrite it on NtRaiseException.
+  FrontendData->TmpRecord = FEX::Windows::HandleGuestException(Fault, *Rec, GuestContext->Eip, GuestContext->Eax, GuestContext->Ecx, FirstChance);
+  if (Rec->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+    GuestContext->EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
+  }
+  // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
+
+  Context::UnlockJITContext();
+  NtRaiseException(&FrontendData->TmpRecord, GetTLS().EntryContext(), FirstChance);
+}
+
+[[noreturn]]
+static void SynchronousExceptionHandler(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) {
+  auto Thread = Frame->Thread;
+  WOW64_CONTEXT* WowContext = GetWow64Context();
+  auto* XSave = reinterpret_cast<XSAVE_FORMAT*>(WowContext->ExtendedRegisters);
+  XSave->ControlWord = 0x27f;
+  XSave->MxCsr = 0x1f80;
+
+  Context::StoreWowContextFromState(WowContext);
+
+  EXCEPTION_RECORD Record = FEX::Windows::ReconstructExceptionRecordFromSynchronousFault(Frame->SynchronousFaultData);
+
+  // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
+  RaiseException(Thread, &Record, WowContext, Frame->SynchronousFaultData);
+
+  ERROR_AND_DIE_FMT("This should always noreturn");
+}
+} // namespace Exception
+
 // Calls a 1-argument function `Func` setting the parent unwind frame information to the given SP and PC
 __attribute__((naked)) extern "C" uint64_t SEHFrameTrampoline1Args(void* Arg0, void* Func, uint64_t Sp, uint64_t Pc) {
   asm(".seh_proc SEHFrameTrampoline1Args;"
@@ -423,11 +540,11 @@ public:
   WowSyscallHandler() = default;
 
   static void HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame) {
-    const uint64_t ReturnRIP = *(uint32_t*)(Frame->State.gregs[FEXCore::X86State::REG_RSP]); // Return address from the stack
-    uint64_t ReturnRSP = Frame->State.gregs[FEXCore::X86State::REG_RSP] + 4;                 // Stack pointer after popping return address
-    uint64_t ReturnRAX = 0;
+    const uint32_t ReturnRIP = *(uint32_t*)(Frame->State.gregs[FEXCore::X86State::REG_RSP]); // Return address from the stack
+    uint32_t ReturnRSP = Frame->State.gregs[FEXCore::X86State::REG_RSP] + 4;                 // Stack pointer after popping return address
+    uint32_t ReturnRAX = 0;
 
-    if (Frame->State.rip == (uint64_t)BridgeInstrs::UnixCall) {
+    if (Frame->State.rip == static_cast<uint32_t>(reinterpret_cast<uintptr_t>(BridgeInstrs::UnixCall))) {
       struct StackLayout {
         unixlib_handle_t Handle;
         UINT32 ID;
@@ -439,11 +556,11 @@ public:
 
       Context::FlushThreadStateContext();
       Context::UnlockJITContext();
-      ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, ULongToPtr(StackArgs->Args)));
+      ReturnRAX = static_cast<uint32_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, ULongToPtr(StackArgs->Args)));
       Context::LockJITContext();
       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
-    } else if (Frame->State.rip == (uint64_t)BridgeInstrs::Syscall) {
-      const uint64_t EntryRAX = Frame->State.gregs[FEXCore::X86State::REG_RAX];
+    } else if (Frame->State.rip == static_cast<uint32_t>(reinterpret_cast<uintptr_t>(BridgeInstrs::Syscall))) {
+      const uint32_t EntryRAX = Frame->State.gregs[FEXCore::X86State::REG_RAX];
 
       Frame->State.gregs[FEXCore::X86State::REG_RSP] = ReturnRSP;
       Frame->State.rip = ReturnRIP;
@@ -451,7 +568,7 @@ public:
       Context::FlushThreadStateContext();
       Context::UnlockJITContext();
       Wow64ProcessPendingCrossProcessItems();
-      ReturnRAX = static_cast<uint64_t>(Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), reinterpret_cast<UINT*>(ReturnRSP + 4)));
+      ReturnRAX = static_cast<uint32_t>(Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), reinterpret_cast<UINT*>(ReturnRSP + 4)));
       Context::LockJITContext();
       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
     }
@@ -577,7 +694,59 @@ void BTCpuProcessInit() {
   }
 }
 
-void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {}
+static void SuspendAllThreads() {
+  // Pulse suspending with lock to ensure threads exit.
+
+  const auto CurrentThread = GetCurrentThreadId();
+  while (true) {
+    bool AllSuspended = true;
+    {
+      // Hold the thread creation mutex so none are created while we're suspending.
+      std::scoped_lock Lock(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        bool Self = Thread.first == CurrentThread;
+        if (Self) {
+          // Don't suspend self.
+          continue;
+        }
+
+        auto FrontendData = GetFrontendThreadData(Thread.second);
+        ULONG SuspendCount {};
+        RtlWow64SuspendThread(*FrontendData->ThreadHandle, &SuspendCount);
+
+        if (SuspendCount != 0) {
+          // This will wait for the thread to be suspended. Only execute if we know the thread /should/ be suspended.
+          // SuspendCount may saturate to max, but we don't care here.
+          CONTEXT TmpContext;
+          TmpContext.ContextFlags = CONTEXT_CONTROL;
+          NtGetContextThread(*FrontendData->ThreadHandle, &TmpContext);
+        } else {
+          // Wasn't suspended.
+          AllSuspended = false;
+        }
+      }
+    }
+
+    if (AllSuspended) {
+      // All threads suspended, free to continue.
+      break;
+    }
+
+    // Wait a second to let threads catch up.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
+void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {
+  if (After == false) {
+    // Someone called `NtTerminateProcess`. It is FEX's responsibility to spin down the threads in this moment.
+    // After we return from this, WINE will start indiscriminately killing threads with SIGQUIT.
+    // If we don't stop them now, then locks will be held by dead threads while the final process thread is trying to finish.
+    // This isn't 100% correct since another process calling `NtTerminateProcess` on our current process will SIGQUIT without warning.
+    // We need WINE patches to capture this properly.
+    SuspendAllThreads();
+  }
+}
 
 void BTCpuThreadInit() {
   static constexpr size_t DefaultWow64CS {4};
@@ -605,12 +774,14 @@ void BTCpuThreadInit() {
 
   FEX::Windows::CallRetStack::InitializeThread(Thread);
 
+  Frame->Pointers.SynchronousExceptionHandler = reinterpret_cast<uintptr_t>(&Exception::SynchronousExceptionHandler);
+
   const auto TLS = GetTLS();
   TLS.ThreadState() = Thread;
 
-  Thread->FrontendPtr = new FrontendThreadData(TLS);
-
   auto ThreadTID = GetCurrentThreadId();
+  Thread->FrontendPtr = new FrontendThreadData(
+    TLS, FEX::Windows::DupHandle(GetCurrentThread(), THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT));
   Threads.emplace(ThreadTID, Thread);
   if (StatAllocHandler) {
     Thread->ThreadStats = StatAllocHandler->AllocateSlot(ThreadTID);
@@ -769,6 +940,11 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
     }
   }
 
+  if (Context->Pc == reinterpret_cast<uint64_t>(&FEXCore::Assert::ForcedAssert)) {
+    LogMan::Msg::DFmt("FEX: Forced assert");
+    NtTerminateProcess(NtCurrentProcess(), 0x42);
+  }
+
   if (!Thread || !IsAddressInJit(Context->Pc)) {
     return false;
   }
@@ -787,19 +963,9 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   LogMan::Msg::DFmt("Reconstructing context");
 
   WOW64_CONTEXT* WowContext = Context::ReconstructWowContext(Context);
+
   LogMan::Msg::DFmt("pc: {:X} eip: {:X} code: {:X}", Context->Pc, WowContext->Eip, Exception->ExceptionCode);
-
-  auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
-  BOOL FirstChance = TRUE;
-  EXCEPTION_RECORD GuestException =
-    FEX::Windows::HandleGuestException(Fault, *Exception, WowContext->Eip, WowContext->Eax, WowContext->Ecx, FirstChance);
-  if (GuestException.ExceptionCode == EXCEPTION_SINGLE_STEP) {
-    WowContext->EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
-  }
-  // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
-
-  Context::UnlockJITContext();
-  NtRaiseException(&GuestException, GetTLS().EntryContext(), FirstChance);
+  Exception::RaiseException(Thread, Ptrs->ExceptionRecord, WowContext, Thread->CurrentFrame->SynchronousFaultData);
   return false;
 }
 
@@ -830,8 +996,15 @@ void BTCpuNotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, 
   if (!After) {
     ThreadCreationMutex.lock();
   } else {
-    // MEM_RESET(_UNDO) ignores the passed permissions
-    if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO))) {
+    // MEM_RESET(_UNDO) ignores the passed permissions.
+    // MEM_RESERVE doesn't actually allow anything to use the memory.
+    const bool WasSuccess = Status == STATUS_SUCCESS;
+    const bool IsNotReset = (Type & (MEM_RESET | MEM_RESET_UNDO)) == 0;
+    // (Type & MEM_COMMIT) = Need to track
+    // (Type & (MEM_COMMIT | MEM_RESERVE)) = Need to track
+    // (TYPE & MEM_RESERVE) = No need to track
+    const bool IsNotReserveWithoutCommit = (Type & (MEM_COMMIT | MEM_RESERVE)) != MEM_RESERVE;
+    if (WasSuccess && IsNotReset && IsNotReserveWithoutCommit) {
       InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
     }
     ThreadCreationMutex.unlock();

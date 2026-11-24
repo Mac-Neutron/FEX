@@ -79,19 +79,20 @@ Decoder::Decoder(FEXCore::Core::InternalThreadState* Thread)
     X87Table = &FEXCore::X86Tables::X87F80Ops;
   }
 
-  if (CTX->HostFeatures.SupportsAVX && CTX->HostFeatures.SupportsSVE256) {
+  if (CTX->HostFeatures.SupportsAVX() && CTX->HostFeatures.SupportsSVE256()) {
     VEXTable = &FEXCore::X86Tables::VEXTableOps;
     VEXTableGroup = &FEXCore::X86Tables::VEXTableGroupOps;
-  } else if (CTX->HostFeatures.SupportsAVX) {
+  } else if (CTX->HostFeatures.SupportsAVX()) {
     VEXTable = &FEXCore::X86Tables::VEXTableOps_AVX128;
     VEXTableGroup = &FEXCore::X86Tables::VEXTableGroupOps_AVX128;
   }
 }
 
-bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
+int32_t Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
   // Check for wraparound
   if (Address + Size < Address) {
-    return false;
+    // Say that any bytes that wrapped around are unreadable
+    return -(Address + Size);
   }
 
   // Invalidations that did not visit this thread (see InvalidateExecutableRangeCaches) bump an epoch instead.
@@ -100,24 +101,40 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
     ResetExecutableRangeCache();
   }
 
-  while (Address < ExecutableRangeBase || Address + Size > ExecutableRangeEnd) {
+  if (Thread->CurrentFrame->State.Dr7) [[unlikely]] {
+    // If Dr7 has anything enabled then check it.
+    for (size_t i = 0; i < Core::CPUState::NUM_DEBUG_ADDRESSES; ++i) {
+      if (Core::CPUState::IsInstructionBPEnabled(i, Thread->CurrentFrame->State.Dr7)) {
+        size_t DrSize = Core::CPUState::BreakpointSize(i, Thread->CurrentFrame->State.Dr7);
+        if (Address >= Thread->CurrentFrame->State.Dr[i] && (Address + Size - 1) < (Thread->CurrentFrame->State.Dr[i] + DrSize)) {
+          HitBreakpoint = i;
+          return false;
+        }
+      }
+    }
+  }
+
+  uint64_t RemainingSize = Size;
+  while (Address < ExecutableRangeBase || Address + RemainingSize > ExecutableRangeEnd) {
     auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, Address);
     ExecutableRangeBase = RangeInfo.Base;
     ExecutableRangeEnd = RangeInfo.Base + RangeInfo.Size;
     ExecutableRangeWritable = RangeInfo.Writable;
 
     if (RangeInfo.Size == 0) {
-      return false;
+      // Return the number of bytes that couldn't be decoded.
+      return -(Size - RemainingSize);
     }
 
     uint64_t RangeRemainingSize = ExecutableRangeEnd - Address;
-    if (Size > RangeRemainingSize) {
-      Size -= RangeRemainingSize;
+    if (RemainingSize > RangeRemainingSize) {
+      RemainingSize -= RangeRemainingSize;
       Address += RangeRemainingSize;
     }
   }
 
-  return true;
+  // Say all bytes are readable.
+  return Size;
 }
 
 uint8_t Decoder::ReadByte() {
@@ -135,7 +152,7 @@ uint8_t Decoder::ReadByte() {
 
 std::optional<uint8_t> Decoder::PeekByte(uint8_t Offset) {
   uint64_t ByteAddress = reinterpret_cast<uint64_t>(InstStream.InstStream + InstructionSize + Offset);
-  if (CheckRangeExecutable(ByteAddress, 1)) {
+  if (CheckRangeExecutable(ByteAddress, 1) == 1) {
     return InstStream.AdjustedInstStream[InstructionSize + Offset];
   } else {
     return std::nullopt;
@@ -149,7 +166,8 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
   uint64_t Address = reinterpret_cast<uint64_t>(InstStream.InstStream + InstructionSize);
   LastFieldReadOffset = (uint8_t)InstructionSize;
   LastFieldReadSize = Size;
-  if (CheckRangeExecutable(Address, Size)) {
+  auto ReadableSize = CheckRangeExecutable(Address, Size);
+  if (ReadableSize == Size) {
     std::memcpy(&Res, &InstStream.AdjustedInstStream[InstructionSize], Size);
   } else {
     HitNonExecutableRange = true;
@@ -157,13 +175,14 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
     Res = 0;
   }
 
-
+  // Skip the number of decoded bytes regardless to get instruction size.
+  // Even partially decoded instruction.
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-  for (size_t i = 0; i < Size; ++i) {
+  for (size_t i = 0; i < std::abs(ReadableSize); ++i) {
     ReadByte();
   }
 #else
-  SkipBytes(Size);
+  SkipBytes(std::abs(ReadableSize));
 #endif
 
   if (Relocations) {
@@ -375,6 +394,10 @@ Decoder::DecodedBlockStatus Decoder::NormalOp(const FEXCore::X86Tables::X86InstI
 
   if (Info->Type == FEXCore::X86Tables::TYPE_INVALID) {
     return DecodedBlockStatus::INVALID_INST;
+  }
+
+  if (Info->Type == FEXCore::X86Tables::TYPE_UNIMPLEMENTED) {
+    return DecodedBlockStatus::UNIMPLEMENTED_INST;
   }
 
   if (!(Info->Flags & FEXCore::X86Tables::InstFlags::FLAGS_SUPPORTS_LOCK) && (DecodeInst->Flags & DecodeFlags::FLAG_LOCK)) {
@@ -686,6 +709,10 @@ Decoder::DecodedBlockStatus Decoder::NormalOpHeader(const FEXCore::X86Tables::X8
     return DecodedBlockStatus::INVALID_INST;
   }
 
+  if (Info->Type == FEXCore::X86Tables::TYPE_UNIMPLEMENTED) {
+    return DecodedBlockStatus::UNIMPLEMENTED_INST;
+  }
+
   LOGMAN_THROW_A_FMT(Info->Type != FEXCore::X86Tables::TYPE_REX_PREFIX, "REX PREFIX should have been decoded before this!");
 
   // A normal instruction is the most likely.
@@ -736,7 +763,7 @@ Decoder::DecodedBlockStatus Decoder::NormalOpHeader(const FEXCore::X86Tables::X8
     if (LocalInfo->Type == FEXCore::X86Tables::TYPE_SECOND_GROUP_MODRM && ModRM.mod == 0b11) {
       // Everything in this group is privileged instructions aside from XGETBV
       constexpr std::array<uint8_t, 8> RegToField = {
-        255, 0, 1, 2, 255, 255, 255, 3,
+        255, 0, 1, 2, 255, 3, 255, 4,
       };
       uint8_t Field = RegToField[ModRM.reg];
       if (Field == 255) {
@@ -745,6 +772,9 @@ Decoder::DecodedBlockStatus Decoder::NormalOpHeader(const FEXCore::X86Tables::X8
 
       LocalOp = (Field << 3) | ModRM.rm;
       return NormalOp(&SecondModRMTableOps[LocalOp], LocalOp);
+    } else if (LocalInfo->Type == FEXCore::X86Tables::TYPE_SECOND_GROUP_MODRM && ModRM.reg == 5) {
+      // Special case 0x0F 0x01 /5 group as they are currently all reserved.
+      return DecodedBlockStatus::UNIMPLEMENTED_INST;
     } else {
       return NormalOp(&SecondInstGroupOps[LocalOp], LocalOp);
     }
@@ -1085,20 +1115,26 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
   // Will be set if DecodeInstructionImpl tries to read non-executable memory
   HitNonExecutableRange = false;
   HitBadRelocation = false;
+  HitBreakpoint = ~0U;
   auto ErrorDuringDecoding = DecodeInstructionImpl(PC);
 
   if (ErrorDuringDecoding != DecodedBlockStatus::SUCCESS || HitNonExecutableRange || HitBadRelocation) [[unlikely]] {
     // Put an invalid instruction in the stream so the core can raise SIGILL if hit
     // Error while decoding instruction. We don't know the table or instruction size
-    const auto InstSize = DecodeInst->InstSize;
     DecodeInst->TableInfo = nullptr;
-    DecodeInst->InstSize = 0;
+
+    if (HitBreakpoint != ~0U) {
+      return static_cast<Decoder::DecodedBlockStatus>(FEXCore::ToUnderlying(DecodedBlockStatus::BREAKPOINT_0) + HitBreakpoint);
+    }
 
     // A decode error can be caused by substituting zero for an inaccessible
     // instruction byte, so the instruction fetch fault takes priority.
     if (HitNonExecutableRange) {
-      return InstSize ? DecodedBlockStatus::PARTIAL_DECODE_INST : DecodedBlockStatus::NOEXEC_INST;
+      return DecodeInst->InstSize ? DecodedBlockStatus::PARTIAL_DECODE_INST : DecodedBlockStatus::NOEXEC_INST;
     }
+
+    // Keep InstSize around for PARTIAL_DECODE_INST so we can get the offset where it partial decoded.
+    DecodeInst->InstSize = 0;
 
     if (HitBadRelocation) {
       return DecodedBlockStatus::BAD_RELOCATION;
@@ -1657,6 +1693,10 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
           EraseBlock = true;
         } else {
           LogMan::Msg::EFmt("{} instruction in entry block: {:X}",
+                            BlockIt->BlockStatus == DecodedBlockStatus::BREAKPOINT_0       ? "Breakpoint" :
+                            BlockIt->BlockStatus == DecodedBlockStatus::BREAKPOINT_1       ? "Breakpoint" :
+                            BlockIt->BlockStatus == DecodedBlockStatus::BREAKPOINT_2       ? "Breakpoint" :
+                            BlockIt->BlockStatus == DecodedBlockStatus::BREAKPOINT_3       ? "Breakpoint" :
                             BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST       ? "Invalid" :
                             BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST        ? "NoExec" :
                             BlockIt->BlockStatus == DecodedBlockStatus::BAD_RELOCATION     ? "BadRelocation" :

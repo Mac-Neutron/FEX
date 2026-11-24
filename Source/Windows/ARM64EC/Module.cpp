@@ -138,7 +138,10 @@ struct ThreadCPUArea {
 };
 
 struct FrontendThreadData {
+  FEX::Windows::ScopedHandle ThreadHandle;
   bool InLockedRWXRead {};
+  FrontendThreadData(FEX::Windows::ScopedHandle&& ThreadHandle)
+    : ThreadHandle {std::move(ThreadHandle)} {}
 };
 
 namespace {
@@ -450,6 +453,67 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
     State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (Context.FltSave.StatusWord >> 11) & 0b111;
     State.AbridgedFTW = Context.FltSave.TagWord;
   }
+
+  // TODO: These are super incorrect for debug registers.
+  if constexpr (false) {
+    if ((Context.ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS) {
+      // If any of the debug register state changed then we need to invalidate.
+      const bool Dr0Changed = (Context.Dr0 != State.Dr[0]) || ((Context.Dr7 ^ State.Dr7) & ((0b1111 << 16) | (0b11 << 0)));
+      const bool Dr1Changed = (Context.Dr1 != State.Dr[1]) || ((Context.Dr7 ^ State.Dr7) & ((0b1111 << 20) | (0b11 << 2)));
+      const bool Dr2Changed = (Context.Dr2 != State.Dr[2]) || ((Context.Dr7 ^ State.Dr7) & ((0b1111 << 24) | (0b11 << 4)));
+      const bool Dr3Changed = (Context.Dr3 != State.Dr[3]) || ((Context.Dr7 ^ State.Dr7) & ((0b1111 << 28) | (0b11 << 6)));
+
+      if (Dr0Changed || Dr1Changed || Dr2Changed || Dr3Changed) {
+        std::scoped_lock Lock(ThreadCreationMutex);
+        // Need to clear both context and state addresses if changed.
+        // Only if the BP type was instruction class.
+        if (Dr0Changed) {
+          if (Context.Dr0 && ((Context.Dr7 >> 16) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(Context.Dr0, 8, false);
+          }
+
+          if (State.Dr[0] && ((State.Dr7 >> 16) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[0], 8, false);
+          }
+        }
+        if (Dr1Changed) {
+          if (Context.Dr1 && ((Context.Dr7 >> 20) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(Context.Dr1, 8, false);
+          }
+
+          if (State.Dr[1] && ((State.Dr7 >> 20) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[1], 8, false);
+          }
+        }
+        if (Dr2Changed) {
+          if (Context.Dr2 && ((Context.Dr7 >> 24) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(Context.Dr2, 8, false);
+          }
+
+          if (State.Dr[2] && ((State.Dr7 >> 24) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[2], 8, false);
+          }
+        }
+        if (Dr3Changed) {
+          if (Context.Dr3 && ((Context.Dr7 >> 28) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(Context.Dr3, 8, false);
+          }
+
+          if (State.Dr[3] && ((State.Dr7 >> 28) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[3], 8, false);
+          }
+        }
+      }
+
+      // Update context now that we have invalidated.
+      State.Dr[0] = Context.Dr0;
+      State.Dr[1] = Context.Dr1;
+      State.Dr[2] = Context.Dr2;
+      State.Dr[3] = Context.Dr3;
+      State.Dr6 = Context.Dr6;
+      State.Dr7 = Context.Dr7;
+    }
+  }
 }
 
 static void ReconstructThreadState(FEXCore::Core::InternalThreadState* Thread, ARM64_NT_CONTEXT& Context) {
@@ -471,6 +535,16 @@ static void ReconstructThreadState(FEXCore::Core::InternalThreadState* Thread, A
   // Spill EFlags
   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, true, Context.X, Context.Cpsr);
   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
+
+  // TODO: These are super incorrect for debug registers.
+  if constexpr (false) {
+    State.Dr[0] = Context.Bvr[0];
+    State.Dr[1] = Context.Bvr[1];
+    State.Dr[2] = Context.Bvr[2];
+    State.Dr[3] = Context.Bvr[3];
+    State.Dr6 = Context.Bcr[0];
+    State.Dr7 = Context.Bcr[1];
+  }
 }
 
 // Reconstructs an x64 context from the input thread's state, packed into a regular ARM64 context following the ARM64EC register mapping
@@ -478,11 +552,6 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   ARM64_NT_CONTEXT ECContext {};
 
   ECContext.ContextFlags = CONTEXT_ARM64_FULL;
-  if (CPUFeatures->IsFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)) {
-    // This is a FEX extension and requires corresponding wine-side patches to be of use, however it is harmless to set
-    // even if those patches are not used.
-    ECContext.ContextFlags |= CONTEXT_ARM64_FEX_YMMSTATE;
-  }
 
   auto& State = Thread->CurrentFrame->State;
 
@@ -539,6 +608,17 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   ECContext.Fpcr = FPCR;
   ECContext.Fpsr = FPSR;
 
+  // TODO: These are super incorrect for debug registers.
+  if constexpr (false) {
+    // Debug registers
+    ECContext.Bvr[0] = State.Dr[0];
+    ECContext.Bvr[1] = State.Dr[1];
+    ECContext.Bvr[2] = State.Dr[2];
+    ECContext.Bvr[3] = State.Dr[3];
+    ECContext.Bcr[0] = State.Dr6;
+    ECContext.Bcr[1] = State.Dr7;
+  }
+
   return ECContext;
 }
 
@@ -579,20 +659,13 @@ static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, co
 static void SynchronousExceptionHandler(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) {
   // Coming in to this function, the guest state is synchronized and the host thread is in a safe location.
   auto Thread = Frame->Thread;
-  auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
 
   uint64_t FPCR, FPSR;
   __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
   __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
 
   auto Context = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR));
-  EXCEPTION_RECORD Record = {};
-  switch (Fault.Signal) {
-  case FEXCore::Core::FAULT_SIGILL: Record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION; break;
-  case FEXCore::Core::FAULT_SIGTRAP: Record.ExceptionCode = EXCEPTION_BREAKPOINT; break;
-  case FEXCore::Core::FAULT_SIGSEGV: Record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION; break;
-  default: ERROR_AND_DIE_FMT("Unknown fault signal"); break;
-  }
+  EXCEPTION_RECORD Record = FEX::Windows::ReconstructExceptionRecordFromSynchronousFault(Thread->CurrentFrame->SynchronousFaultData);
 
   RaiseException(Thread, Record, Context);
   ERROR_AND_DIE_FMT("This should always noreturn");
@@ -742,7 +815,58 @@ NTSTATUS ProcessInit() {
   return STATUS_SUCCESS;
 }
 
-void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
+static void SuspendAllThreads() {
+  // Pulse suspending with lock to ensure threads exit.
+  const auto CurrentThread = GetCurrentThreadId();
+  while (true) {
+    bool AllSuspended = true;
+    {
+      // Hold the thread creation mutex so none are created while we're suspending.
+      std::scoped_lock Lock(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        bool Self = Thread.first == CurrentThread;
+        if (Self) {
+          // Don't suspend self.
+          continue;
+        }
+
+        auto FrontendData = GetFrontendThreadData(Thread.second);
+        ULONG SuspendCount {};
+        RtlWow64SuspendThread(*FrontendData->ThreadHandle, &SuspendCount);
+
+        if (SuspendCount != 0) {
+          // This will wait for the thread to be suspended. Only execute if we know the thread /should/ be suspended.
+          // SuspendCount may saturate to max, but we don't care here.
+          CONTEXT TmpContext;
+          TmpContext.ContextFlags = CONTEXT_CONTROL;
+          NtGetContextThread(*FrontendData->ThreadHandle, &TmpContext);
+        } else {
+          // Wasn't suspended.
+          AllSuspended = false;
+        }
+      }
+    }
+
+    if (AllSuspended) {
+      // All threads suspended, free to continue.
+      break;
+    }
+
+    // Wait a second to let threads catch up.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
+void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
+  if (After == false) {
+    // Someone called `NtTerminateProcess`. It is FEX's responsibility to spin down the threads in this moment.
+    // After we return from this, WINE will start indiscriminately killing threads with SIGQUIT.
+    // If we don't stop them now, then locks will be held by dead threads while the final process thread is trying to finish.
+    // This isn't 100% correct since another process calling `NtTerminateProcess` on our current process will SIGQUIT without warning.
+    // We need WINE patches to capture this properly.
+    SuspendAllThreads();
+  }
+}
 
 class ScopedCallbackDisable {
 private:
@@ -814,6 +938,11 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     return true;
   }
 
+  if (NativeContext->Pc == reinterpret_cast<uint64_t>(&FEXCore::Assert::ForcedAssert)) {
+    LogMan::Msg::DFmt("FEX: Forced assert");
+    NtTerminateProcess(NtCurrentProcess(), 0x42);
+  }
+
   if (!IsJIT && !IsDispatcherAddress(NativeContext->Pc)) {
     LogMan::Msg::DFmt("Passing through exception");
     return false;
@@ -870,6 +999,70 @@ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestConte
     NtContinueNative(NativeContext, false);
   }
 
+  // TODO: These are super incorrect for debug registers.
+  if constexpr (false) {
+    auto Thread = CPUArea.ThreadState();
+    auto& State = Thread->CurrentFrame->State;
+
+    if ((GuestContext->ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS) {
+      // If any of the debug register state changed then we need to invalidate.
+      const bool Dr0Changed = (GuestContext->Dr0 != State.Dr[0]) || ((GuestContext->Dr7 ^ State.Dr7) & ((0b1111 << 16) | (0b11 << 0)));
+      const bool Dr1Changed = (GuestContext->Dr1 != State.Dr[1]) || ((GuestContext->Dr7 ^ State.Dr7) & ((0b1111 << 20) | (0b11 << 2)));
+      const bool Dr2Changed = (GuestContext->Dr2 != State.Dr[2]) || ((GuestContext->Dr7 ^ State.Dr7) & ((0b1111 << 24) | (0b11 << 4)));
+      const bool Dr3Changed = (GuestContext->Dr3 != State.Dr[3]) || ((GuestContext->Dr7 ^ State.Dr7) & ((0b1111 << 28) | (0b11 << 6)));
+
+      if (Dr0Changed || Dr1Changed || Dr2Changed || Dr3Changed) {
+        std::scoped_lock Lock(ThreadCreationMutex);
+        // Need to clear both context and state addresses if changed.
+        // Only if the BP type was instruction class.
+        if (Dr0Changed) {
+          if (GuestContext->Dr0 && ((GuestContext->Dr7 >> 16) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(GuestContext->Dr0, 8, false);
+          }
+
+          if (State.Dr[0] && ((State.Dr7 >> 16) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[0], 8, false);
+          }
+        }
+        if (Dr1Changed) {
+          if (GuestContext->Dr1 && ((GuestContext->Dr7 >> 20) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(GuestContext->Dr1, 8, false);
+          }
+
+          if (State.Dr[1] && ((State.Dr7 >> 20) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[1], 8, false);
+          }
+        }
+        if (Dr2Changed) {
+          if (GuestContext->Dr2 && ((GuestContext->Dr7 >> 24) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(GuestContext->Dr2, 8, false);
+          }
+
+          if (State.Dr[2] && ((State.Dr7 >> 24) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[2], 8, false);
+          }
+        }
+        if (Dr3Changed) {
+          if (GuestContext->Dr3 && ((GuestContext->Dr7 >> 28) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(GuestContext->Dr3, 8, false);
+          }
+
+          if (State.Dr[3] && ((State.Dr7 >> 28) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[3], 8, false);
+          }
+        }
+      }
+
+      // Update context now that we have invalidated.
+      State.Dr[0] = GuestContext->Dr0;
+      State.Dr[1] = GuestContext->Dr1;
+      State.Dr[2] = GuestContext->Dr2;
+      State.Dr[3] = GuestContext->Dr3;
+      State.Dr6 = GuestContext->Dr6;
+      State.Dr7 = GuestContext->Dr7;
+    }
+  }
+
   CPUArea.Area->InSimulation = false;
   CPUArea.Area->InSyscallCallback = false;
   return STATUS_SUCCESS;
@@ -883,8 +1076,15 @@ void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL 
   if (!After) {
     ThreadCreationMutex.lock();
   } else {
-    // MEM_RESET(_UNDO) ignores the passed permissions
-    if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO))) {
+    // MEM_RESET(_UNDO) ignores the passed permissions.
+    // MEM_RESERVE doesn't actually allow anything to use the memory.
+    const bool WasSuccess = Status == STATUS_SUCCESS;
+    const bool IsNotReset = (Type & (MEM_RESET | MEM_RESET_UNDO)) == 0;
+    // (Type & MEM_COMMIT) = Need to track
+    // (Type & (MEM_COMMIT | MEM_RESERVE)) = Need to track
+    // (TYPE & MEM_RESERVE) = No need to track
+    const bool IsNotReserveWithoutCommit = (Type & (MEM_COMMIT | MEM_RESERVE)) != MEM_RESERVE;
+    if (WasSuccess && IsNotReset && IsNotReserveWithoutCommit) {
       InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
     }
     ThreadCreationMutex.unlock();
@@ -1073,7 +1273,7 @@ NTSTATUS ThreadInit() {
   uint64_t EnterECFillSRA = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterECFillSRA;
   CPUArea.DispatcherLoopTopEnterECFillSRA() = EnterECFillSRA;
 
-  CPUArea.ContextAmd64() = {.ContextFlags = CONTEXT_CONTROL | CONTEXT_SEGMENTS | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT,
+  CPUArea.ContextAmd64() = {.ContextFlags = CONTEXT_CONTROL | CONTEXT_SEGMENTS | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS,
                             .AMD64_SegCs = (FEXCore::Core::CPUState::DEFAULT_USER_CS << 3) | 3,
                             .AMD64_SegDs = 0x2b,
                             .AMD64_SegEs = 0x2b,
@@ -1086,7 +1286,8 @@ NTSTATUS ThreadInit() {
                             .AMD64_ControlWord = 0x27f};
   Exception::LoadStateFromECContext(Thread, CPUArea.ContextAmd64().AMD64_Context);
 
-  Thread->FrontendPtr = new FrontendThreadData();
+  Thread->FrontendPtr =
+    new FrontendThreadData(FEX::Windows::DupHandle(GetCurrentThread(), THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT));
 
   {
     auto ThreadTID = GetCurrentThreadId();

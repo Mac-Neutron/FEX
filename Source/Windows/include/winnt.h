@@ -9,6 +9,8 @@
 extern "C" {
 #endif
 
+#define CONTEXT_I386_XSTATE 0x00010040
+
 typedef struct ___IMAGE_LOAD_CONFIG_CODE_INTEGRITY {
   WORD Flags;
   WORD Catalog;
@@ -188,6 +190,32 @@ typedef struct _CONTEXT_EX {
 #endif
 } CONTEXT_EX, *PCONTEXT_EX;
 
+typedef struct _YMMCONTEXT {
+  M128A Ymm0;
+  M128A Ymm1;
+  M128A Ymm2;
+  M128A Ymm3;
+  M128A Ymm4;
+  M128A Ymm5;
+  M128A Ymm6;
+  M128A Ymm7;
+  M128A Ymm8;
+  M128A Ymm9;
+  M128A Ymm10;
+  M128A Ymm11;
+  M128A Ymm12;
+  M128A Ymm13;
+  M128A Ymm14;
+  M128A Ymm15;
+} YMMCONTEXT, *PYMMCONTEXT;
+
+typedef struct _XSTATE {
+  ULONG64 Mask;
+  ULONG64 CompactionMask;
+  ULONG64 Reserved[6];
+  YMMCONTEXT YmmContext;
+} XSTATE, *PXSTATE;
+
 // From process hacker
 typedef struct _IMAGE_VOLATILE_METADATA {
   ULONG Size;
@@ -208,9 +236,6 @@ typedef struct _IMAGE_VOLATILE_RANGE_METADATA {
 } IMAGE_VOLATILE_RANGE_METADATA, *PIMAGE_VOLATILE_RANGE_METADATA;
 
 NTSYSAPI DWORD WINAPI RtlRunOnceExecuteOnce(PRTL_RUN_ONCE, PRTL_RUN_ONCE_INIT_FN, PVOID, PVOID*);
-
-// This is a FEX extension, and requires corresponding wine patches
-#define CONTEXT_ARM64_FEX_YMMSTATE (CONTEXT_ARM64 | 0x00000040)
 
 #ifdef __cplusplus
 }

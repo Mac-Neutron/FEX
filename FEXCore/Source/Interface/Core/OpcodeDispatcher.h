@@ -19,9 +19,11 @@
 #include <FEXCore/fextl/map.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
 #include <fmt/format.h>
+#include <span>
 #include <stddef.h>
 #include <utility>
 #include <xxhash.h>
@@ -207,9 +209,12 @@ public:
     FlushRegisterCache();
     return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize);
   }
-  IRPair<IROp_Break> Break(BreakDefinition Reason) {
+  IRPair<IROp_Break> Break(BreakDefinition Reason, Ref RelocatedPC = nullptr) {
     FlushRegisterCache();
-    return _Break(Reason);
+    if (!RelocatedPC) {
+      RelocatedPC = Constant(0);
+    }
+    return _Break(Reason, RelocatedPC);
   }
   IRPair<IROp_Thunk> Thunk(Ref ArgPtr, SHA256Sum ThunkNameHash) {
     FlushRegisterCache();
@@ -217,6 +222,8 @@ public:
   }
 
   bool FinishOp(uint64_t NextRIP, bool LastOp) {
+    ++RegCache.Index;
+
     // If we are switching to a new block and this current block has yet to set a RIP
     // Then we need to insert an unconditional jump from the current block to the one we are going to
     // This happens most frequently when an instruction jumps backwards to another location
@@ -898,7 +905,8 @@ public:
   void Extrq(OpcodeArgs);
   void Insertq(OpcodeArgs);
 
-  void BreakOp(OpcodeArgs, FEXCore::IR::BreakDefinition BreakDefinition);
+  void BreakOp(OpcodeArgs, FEXCore::IR::BreakDefinition BreakDefinition, Ref RelocatedPC = nullptr);
+  void BreakpointOp(OpcodeArgs, uint32_t BP);
   void UnimplementedOp(OpcodeArgs);
   void PermissionRestrictedOp(OpcodeArgs);
 
@@ -926,6 +934,66 @@ public:
     auto LookupIndexes =
       LoadAndCacheIndexedNamedVectorConstant(OpSize::i128Bit, FEXCore::IR::IndexNamedVectorConstant::INDEXED_NAMED_VECTOR_PSHUFD, Shuffle * 16);
     return _VTBL1(OpSize::i128Bit, Src, LookupIndexes);
+  }
+
+  // Returns true if Value == SHADataShuffle(X), and X is the result of one of Ops.
+  bool IsSHADataShuffle(Ref Value, std::span<const IROps> Ops) {
+    const Ref X = GetArgIfOp(Value, OP_VTBL1, 0);
+    if (!X) {
+      return false;
+    }
+
+    const auto XOp = GetOpHeader(WrapNode(X))->Op;
+    return std::any_of(Ops.begin(), Ops.end(), [XOp](auto Op) { return XOp == Op; });
+  }
+
+  // Helper that determine the last "real" definition of a register,
+  // following through up to a single copy. This is useful for detecting
+  // patterns necessary for some peephole optimizations.
+  Ref LastDefFollowCopy(const X86Tables::DecodedOperand& Operand) {
+    // Currently only XMM registers are supported by this helper.
+    // TODO: Support YMM, and GPRs as well when needed.
+    if (!Operand.IsGPR()) {
+      return nullptr;
+    }
+
+    const auto Reg = Operand.Data.GPR.GPR;
+    LOGMAN_THROW_A_FMT(Reg >= X86State::REG_XMM_0 && Reg <= X86State::REG_XMM_15, "LastDefFollowCopy only supports XMM registers");
+
+    const int RegisterIndex = FPR0Index + Reg - X86State::REG_XMM_0;
+    const Ref LastWrite = RegCache.LastDef[RegisterIndex];
+    const auto Header = LastWrite ? GetOpHeader(WrapNode(LastWrite)) : nullptr;
+
+    if (!Header || Header->Op != OP_LOADREGISTER) {
+      return LastWrite;
+    }
+
+    // Check if the last write was a copy of a different XMM.
+    const auto Copy = Header->C<IROp_LoadRegister>();
+    if (Copy->Class != RegClass::FPR || Copy->Reg > FPR15Index - FPR0Index) {
+      return LastWrite;
+    }
+
+    // If the last write was a copy, check if the source of the copy was written in this block,
+    // and if so, return the source instruction instead.
+    const int CopyRegister = FPR0Index + Copy->Reg;
+    const auto CopyInstructionIndex = RegCache.LastDefIndex[RegisterIndex];
+
+    if (!RegCache.LastDef[CopyRegister]) {
+      return nullptr;
+    }
+
+    if (RegCache.LastDefIndex[CopyRegister] < CopyInstructionIndex) {
+      return RegCache.LastDef[CopyRegister];
+    }
+
+    if (RegCache.LastDefIndex[CopyRegister] > CopyInstructionIndex && RegCache.PrevDef[CopyRegister] &&
+        RegCache.PrevDefIndex[CopyRegister] < CopyInstructionIndex) {
+
+      return RegCache.PrevDef[CopyRegister];
+    }
+
+    return nullptr;
   }
 
   RefPair AVX128_LoadSource_WithOpSize(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags,
@@ -1097,7 +1165,9 @@ public:
   void AVX128_VCVTPH2PS(OpcodeArgs);
   void AVX128_VCVTPS2PH(OpcodeArgs);
   void AVX128_VBCSTNEBF162PS(OpcodeArgs);
+  void AVX128_VBCSTNESH2PS(OpcodeArgs);
   void AVX128_VCVTNEEBF162PS(OpcodeArgs, bool Even);
+  void AVX128_VCVTNEEPH2PS(OpcodeArgs, bool Even);
   void AVX128_VCVTNEPS2BF16(OpcodeArgs);
 
   // End of AVX 128-bit implementation
@@ -1134,13 +1204,15 @@ public:
   void AVXVectorVariableBlend(OpcodeArgs, IR::OpSize ElementSize);
 
   void AVXVBCSTNEBF162PS(OpcodeArgs);
+  void AVXVBCSTNESH2PS(OpcodeArgs);
   void AVXVCVTNEEBF162PS(OpcodeArgs, bool Even);
+  void AVXVCVTNEEPH2PS(OpcodeArgs, bool Even);
   void AVXVCVTNEPS2BF16(OpcodeArgs);
 
   // End of AVX 256-bit implementation
 
   void InvalidOp(OpcodeArgs);
-  void NoExecOp(OpcodeArgs);
+  void NoExecOrPartialOp(OpcodeArgs);
 
   void SetPackedRFLAG(bool Lower8, Ref Src);
   Ref GetPackedRFLAG(uint32_t FlagsMask = ~0U);
@@ -1191,10 +1263,20 @@ public:
     if (!SRAOnly) {
       RectifyCarryInvert(CFInvertedABI);
 
-      // Also we can't trust the LastDef accross block boundaries, so clear that as well.
+      // Also we can't trust the LastDef or PrevDef arrays accross block boundaries, so clear them as well.
       for (auto& Def : RegCache.LastDef) {
         Def = nullptr;
       }
+      for (auto& Def : RegCache.PrevDef) {
+        Def = nullptr;
+      }
+      for (auto& DefIndex : RegCache.LastDefIndex) {
+        DefIndex = 0;
+      }
+      for (auto& DefIndex : RegCache.PrevDefIndex) {
+        DefIndex = 0;
+      }
+      RegCache.Index = 0;
     }
 
     if (!MMXOnly) {
@@ -1311,7 +1393,7 @@ protected:
       /* On ASIMD platforms, the emulation happens to preserve NZCV, unlike the
        * more optimal SVE implementation that clobbers.
        */
-      if (!CTX->HostFeatures.SupportsSVE128 && !CTX->HostFeatures.SupportsSVE256) {
+      if (!CTX->HostFeatures.SupportsSVE()) {
         return;
       }
 
@@ -1658,7 +1740,7 @@ private:
   }
 
   constexpr OpSize GetGuestVectorLength() const {
-    return (CTX->HostFeatures.SupportsSVE256 && CTX->HostFeatures.SupportsAVX) ? OpSize::i256Bit : OpSize::i128Bit;
+    return (CTX->HostFeatures.SupportsSVE256() && CTX->HostFeatures.SupportsAVX()) ? OpSize::i256Bit : OpSize::i128Bit;
   }
 
   [[nodiscard]]
@@ -2035,8 +2117,16 @@ private:
     Ref Value[64];
 
     // Keep track of where each register was last written to within the current block,
-    // for use in peephole optimizations.
+    // for use in peephole optimizations. LastDefIndex is a parallel structure,
+    // which tracks the index of each Op in LastDef.
     Ref LastDef[64];
+    uint32_t LastDefIndex[64];
+    // Similar to LastDef, but tracks the write before LastDef. Think of it as LastDef^2.
+    Ref PrevDef[64];
+    uint32_t PrevDefIndex[64];
+
+    // The index of the current instruction in the current block.
+    uint32_t Index;
   } RegCache {};
 
   void InvalidateReg(uint8_t Index) {
@@ -2159,7 +2249,10 @@ private:
     RegCache.Value[Index] = Value;
     RegCache.Cached |= Bit;
     RegCache.Written |= Bit;
+    RegCache.PrevDef[Index] = RegCache.LastDef[Index];
+    RegCache.PrevDefIndex[Index] = RegCache.LastDefIndex[Index];
     RegCache.LastDef[Index] = Value;
+    RegCache.LastDefIndex[Index] = RegCache.Index;
   }
 
   void InvalidateHighAVXRegisters() {

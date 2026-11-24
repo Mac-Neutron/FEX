@@ -24,7 +24,22 @@ struct HostFeatures {
   // Whether or not the host supports any kind of SVE implementation.
   [[nodiscard]]
   bool SupportsSVE() const {
-    return SupportsSVE128 || SupportsSVE256;
+    return ProcessFeatures.SupportsSVE128 || ProcessFeatures.SupportsSVE256;
+  }
+
+  [[nodiscard]]
+  bool SupportsSVE128() const {
+    return ProcessFeatures.SupportsSVE128;
+  }
+
+  [[nodiscard]]
+  bool SupportsSVE256() const {
+    return ProcessFeatures.SupportsSVE256;
+  }
+
+  [[nodiscard]]
+  bool SupportsAVX() const {
+    return SupportsAVXInst;
   }
 
   [[nodiscard]]
@@ -37,12 +52,16 @@ struct HostFeatures {
    * Unlike the `HostFeaturesHash` below, this data changes codegen depending on if the process is Linux, Arm64EC, or Wow64.
    */
   struct ProcessFeaturesHash {
-    HostTypeEnum HostType                      : 2 {};
-    uint8_t SupportsFaultFreeSynchronousFaults : 1 {};
+    HostTypeEnum HostType : 2 {};
     // This only determines the starting mode a process started in.
     // The process can technically long jump to-from the other modes.
     uint8_t Is64BitMode : 1 {};
-    uint8_t pad         : 4 {};
+
+    // These are technically HostFeatures, but they differ between Linux, wow64, arm64.
+    uint8_t SupportsSVE128 : 1 {};
+    uint8_t SupportsSVE256 : 1 {};
+
+    uint8_t pad : 3 {};
   };
   static_assert(sizeof(ProcessFeaturesHash) == 1);
 
@@ -67,44 +86,42 @@ struct HostFeatures {
   }
 
   // Affects codegen and is basically machine description.
-  uint32_t DCacheLineLog2              : 4 {};
-  uint32_t SupportsCacheMaintenanceOps : 1 {};
-  uint32_t SupportsAES                 : 1 {};
-  uint32_t SupportsCRC                 : 1 {};
-  uint32_t SupportsCLZERO              : 1 {};
-  uint32_t SupportsAtomics             : 1 {};
-  uint32_t SupportsRCPC                : 1 {};
-  uint32_t SupportsTSOImm9             : 1 {};
-  uint32_t SupportsRAND                : 1 {};
-  uint32_t SupportsAVX                 : 1 {};
-  uint32_t SupportsSVE128              : 1 {};
-  uint32_t SupportsSVE256              : 1 {};
-  uint32_t SupportsSHA                 : 1 {};
-  uint32_t SupportsPMULL_128Bit        : 1 {};
-  uint32_t SupportsCSSC                : 1 {};
-  uint32_t SupportsFCMA                : 1 {};
-  uint32_t SupportsFlagM               : 1 {};
-  uint32_t SupportsFlagM2              : 1 {};
-  uint32_t SupportsRPRES               : 1 {};
-  uint32_t SupportsPreserveAllABI      : 1 {};
-  uint32_t SupportsAES256              : 1 {};
-  uint32_t SupportsSVEBitPerm          : 1 {};
-  uint32_t SupportsCPUIndexInTPIDRRO   : 1 {};
-  uint32_t SupportsFRINTTS             : 1 {};
-  uint32_t SupportsECV                 : 1 {};
-  uint32_t SupportsWFXT                : 1 {};
-  uint32_t Supports3DNow               : 1 {};
-  uint32_t SupportsSSE4a               : 1 {};
-  uint32_t SupportsMOPS                : 1 {};
-  uint32_t SupportsI8MM                : 1 {};
-  uint32_t SupportsDotProd             : 1 {};
-  uint32_t PreferZVAForVZero           : 1 {};
-  uint32_t SupportsAFP                 : 1 {};
-  uint32_t SupportsFloatExceptions     : 1 {};
-  uint32_t SupportsBF16                : 1 {};
+  uint32_t DCacheLineLog2              : 4 {}; // [3:0]
+  uint32_t SupportsCacheMaintenanceOps : 1 {}; // [4]
+  uint32_t SupportsAES                 : 1 {}; // [5]
+  uint32_t SupportsCRC                 : 1 {}; // [6]
+  uint32_t SupportsCLZERO              : 1 {}; // [7]
+  uint32_t SupportsAtomics             : 1 {}; // [8]
+  uint32_t SupportsRCPC                : 1 {}; // [9]
+  uint32_t SupportsTSOImm9             : 1 {}; // [10]
+  uint32_t SupportsRAND                : 1 {}; // [11]
+  uint32_t SupportsSHA                 : 1 {}; // [12]
+  uint32_t SupportsPMULL_128Bit        : 1 {}; // [13]
+  uint32_t SupportsCSSC                : 1 {}; // [14]
+  uint32_t SupportsFCMA                : 1 {}; // [15]
+  uint32_t SupportsFlagM               : 1 {}; // [16]
+  uint32_t SupportsFlagM2              : 1 {}; // [17]
+  uint32_t SupportsRPRES               : 1 {}; // [18]
+  uint32_t SupportsPreserveAllABI      : 1 {}; // [19]
+  uint32_t SupportsAES256              : 1 {}; // [20]
+  uint32_t SupportsSVEBitPerm          : 1 {}; // [21]
+  uint32_t SupportsCPUIndexInTPIDRRO   : 1 {}; // [22]
+  uint32_t SupportsFRINTTS             : 1 {}; // [23]
+  uint32_t SupportsECV                 : 1 {}; // [24]
+  uint32_t SupportsWFXT                : 1 {}; // [25]
+  uint32_t Supports3DNow               : 1 {}; // [26]
+  uint32_t SupportsSSE4a               : 1 {}; // [27]
+  uint32_t SupportsMOPS                : 1 {}; // [28]
+  uint32_t SupportsI8MM                : 1 {}; // [29]
+  uint32_t SupportsDotProd             : 1 {}; // [30]
+  uint32_t PreferZVAForVZero           : 1 {}; // [31]
+  uint32_t SupportsAFP                 : 1 {}; // [32]
+  uint32_t SupportsFloatExceptions     : 1 {}; // [33]
+  uint32_t SupportsBF16                : 1 {}; // [34]
+  uint32_t SupportsAVXInst             : 1 {}; // [35]
   // Flag if this is InstCountCI
-  uint32_t IsInstCountCI : 1 {};
-  uint32_t pad           : 25 {};
+  uint32_t IsInstCountCI : 1 {};  // [36]
+  uint32_t pad           : 27 {}; // [63:37]
 
   // This affects codegen, but it isn't machine state
   ProcessFeaturesHash ProcessFeatures {};

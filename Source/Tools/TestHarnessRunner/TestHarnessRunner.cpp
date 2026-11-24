@@ -18,6 +18,7 @@ $end_info$
 #endif
 
 #include "Common/HostFeatures.h"
+#include "Common/X86Features.h"
 #include "Common/Linux/SBRKAllocations.h"
 #include "HarnessHelpers.h"
 #include "TestHarnessRunner/HostRunner.h"
@@ -44,9 +45,6 @@ $end_info$
 #include <sys/types.h>
 #include <utility>
 
-#ifdef ARCHITECTURE_x86_64
-#include "Common/X86Features.h"
-#endif
 
 void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
   fextl::fmt::print("{} {}\n", LogMan::DebugLevelStr(Level), Message);
@@ -112,81 +110,33 @@ private:
 };
 } // namespace
 
-namespace LongJumpHandler {
+namespace SynchronousException {
 static jmp_buf LongJump {};
 static bool DidFault {};
 
-#ifndef _WIN32
-void RegisterLongJumpHandler(FEX::HLE::SignalDelegator* Handler) {
-  Handler->RegisterFrontendHostSignalHandler(
-    SIGSEGV,
-    [](FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext) {
-      constexpr uint8_t HLT = 0xF4;
-      if (reinterpret_cast<uint8_t*>(Thread->CurrentFrame->State.rip)[0] != HLT) {
-        DidFault = true;
-        return false;
-      }
+[[noreturn]]
+void SynchronousExceptionHandler(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) {
+  auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
 
-      longjmp(LongJumpHandler::LongJump, 1);
-      return false;
-    },
-    true);
-}
-#else
-FEX::DummyHandlers::DummySignalDelegator* Handler;
+  auto& Fault = ThreadObject->Thread->CurrentFrame->SynchronousFaultData;
+  LOGMAN_THROW_A_FMT(Fault.FaultToTopAndGeneratedException, "Synchronous fault needs fault data!");
 
-static void LongJumpHandler() {
-  longjmp(LongJump, 1);
-}
+  // Expecting a SIGSEGV.
+  DidFault = Fault.Signal != FEXCore::Core::FAULT_SIGSEGV;
 
-LONG WINAPI VectoredExceptionHandler(struct _EXCEPTION_POINTERS* ExceptionInfo) {
-  auto Thread = Handler->GetBackingTLSThread();
-  PCONTEXT Context;
-  Context = ExceptionInfo->ContextRecord;
-
-  switch (ExceptionInfo->ExceptionRecord->ExceptionCode) {
-  case STATUS_DATATYPE_MISALIGNMENT: {
-    const auto PC = FEX::ArchHelpers::Context::GetPc(Context);
-    if (!Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
-      // Wasn't a sigbus in JIT code
-      return EXCEPTION_CONTINUE_SEARCH;
-    }
-
-    const auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(true, PC, FEX::ArchHelpers::Context::GetArmGPRs(Context));
-    FEX::ArchHelpers::Context::SetPc(Context, PC + Result.value_or(0));
-    return Result ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
-  }
-  case STATUS_ACCESS_VIOLATION: {
-    constexpr uint8_t HLT = 0xF4;
-    if (reinterpret_cast<uint8_t*>(Thread->CurrentFrame->State.rip)[0] != HLT) {
-      DidFault = true;
-      return EXCEPTION_CONTINUE_SEARCH;
-    }
-
-    FEX::ArchHelpers::Context::SetPc(Context, reinterpret_cast<uint64_t>(LongJumpHandler));
-    return EXCEPTION_CONTINUE_EXECUTION;
-  }
-  default: break;
+  constexpr uint8_t HLT = 0xF4;
+  if (reinterpret_cast<uint8_t*>(ThreadObject->Thread->CurrentFrame->State.rip)[0] != HLT) {
+    // If the instruction wasn't a hlt then it's also a fault.
+    DidFault = true;
   }
 
-  printf("!Fault!\n");
-  printf("\tExceptionCode: 0x%lx\n", ExceptionInfo->ExceptionRecord->ExceptionCode);
-  printf("\tExceptionFlags: 0x%lx\n", ExceptionInfo->ExceptionRecord->ExceptionFlags);
-  printf("\tExceptionRecord: 0x%p\n", ExceptionInfo->ExceptionRecord->ExceptionRecord);
-  printf("\tExceptionAddress: 0x%p\n", ExceptionInfo->ExceptionRecord->ExceptionAddress);
-  printf("\tNumberParameters: 0x%lx\n", ExceptionInfo->ExceptionRecord->NumberParameters);
+  // Leave the test now regardless of state.
+  longjmp(SynchronousException::LongJump, 1);
 
-  return EXCEPTION_CONTINUE_SEARCH;
+  ERROR_AND_DIE_FMT("This should always noreturn");
 }
 
-void RegisterLongJumpHandler(FEX::DummyHandlers::DummySignalDelegator* Handler) {
-  // Install VEH handler.
-  AddVectoredExceptionHandler(0, VectoredExceptionHandler);
-
-  LongJumpHandler::Handler = Handler;
-}
-#endif
-} // namespace LongJumpHandler
+} // namespace SynchronousException
 
 int main(int argc, char** argv, char** const envp) {
 #ifndef _WIN32
@@ -249,17 +199,13 @@ int main(int argc, char** argv, char** const envp) {
   auto CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
 
 #ifndef _WIN32
-  auto SignalDelegation = FEX::HLE::CreateSignalDelegator(CTX.get(), {}, HostFeatures.SupportsAVX, HostFeatures.SupportsSVE256);
+  auto SignalDelegation = FEX::HLE::CreateSignalDelegator(CTX.get(), {}, HostFeatures.SupportsAVX(), HostFeatures.SupportsSVE256());
 #else
-  // Enable exit on HLT while Wine's longjump is broken.
-  //
-  // Once they fix longjump, we can remove this.
-  CTX->EnableExitOnHLT();
   auto SignalDelegation = FEX::WindowsHandlers::CreateSignalDelegator();
 #endif
 
   // Skip any tests that the host doesn't support features for
-  SupportsAVX = HostFeatures.SupportsAVX;
+  SupportsAVX = HostFeatures.SupportsAVX();
 
   bool TestUnsupported = (!SupportsAVX && Loader.RequiresAVX()) || (!HostFeatures.SupportsRAND && Loader.RequiresRAND()) ||
                          (!HostFeatures.SupportsSHA && Loader.RequiresSHA()) || (!HostFeatures.SupportsCLZERO && Loader.RequiresCLZERO()) ||
@@ -269,10 +215,20 @@ int main(int argc, char** argv, char** const envp) {
   bool IsHostRunner = false;
 #if !defined(VIXL_SIMULATOR) && defined(ARCHITECTURE_x86_64)
   IsHostRunner = true;
-  ///< Features that are only unsupported when running using the HostRunner and the CI machine doesn't support the feature getting tested.
   FEX::X86::Features Feature {};
-  const bool Supports3DNow = Feature.Feat_3dnow;
+
   const bool SupportsSSE4A = Feature.Feat_sse4a;
+
+  // Hostrunner doesn't support EMMI while FEX does. CPUID doesn't have a query bit.
+  TestUnsupported |= Loader.RequiresEMMI();
+#else
+  FEX::X86::Features Feature {CTX.get()};
+
+  // Override features that FEX default disables.
+  const bool SupportsSSE4A = true;
+#endif
+
+  const bool Supports3DNow = Feature.Feat_3dnow;
   const bool SupportsBMI1 = Feature.Feat_bmi1;
   const bool SupportsBMI2 = Feature.Feat_bmi2;
   const bool SupportsCLWB = Feature.Feat_clwb;
@@ -290,6 +246,10 @@ int main(int argc, char** argv, char** const envp) {
   const bool SupportsAVXVNNI = Feature.Feat_avx_vnni;
   const bool SupportsSerialize = Feature.Feat_serialize;
   const bool SupportsAVXNEConvert = Feature.Feat_avx_ne_convert;
+  const bool SupportsSHA512 = Feature.Feat_sha512;
+  const bool SupportsAVXIFMA = Feature.Feat_avx_ifma;
+  const bool SupportsAVXVNNIINT8 = Feature.Feat_avx_vnni_int8;
+  const bool SupportsAVXVNNIINT16 = Feature.Feat_avx_vnni_int16;
 
   TestUnsupported |=
     (!Supports3DNow && Loader.Requires3DNow()) || (!SupportsSSE4A && Loader.RequiresSSE4A()) || (!SupportsBMI1 && Loader.RequiresBMI1()) ||
@@ -297,11 +257,14 @@ int main(int argc, char** argv, char** const envp) {
     (!SupportsSSE4_1 && Loader.RequiresSSE4_1()) || (!SupportsSSE4_2 && Loader.RequiresSSE4_2()) ||
     (!SupportsAES && Loader.RequiresAES()) || (!SupportsPCLMUL && Loader.RequiresPCLMUL()) || (!SupportsMOVBE && Loader.RequiresMOVBE()) ||
     (!SupportsADX && Loader.RequiresADX()) || (!SupportsXSAVE && Loader.RequiresXSAVE()) || (!SupportsRDPID && Loader.RequiresRDPID()) ||
-    (!SupportsCLFLOPT && Loader.RequiresCLFLOPT()) || (!SupportsFSGSBase && Loader.RequiresFSGSBase()) || Loader.RequiresEMMI();
+    (!SupportsCLFLOPT && Loader.RequiresCLFLOPT()) || (!SupportsFSGSBase && Loader.RequiresFSGSBase());
   TestUnsupported |= !SupportsAVXVNNI && Loader.RequiresAVXVNNI();
   TestUnsupported |= !SupportsSerialize && Loader.RequiresSerialize();
   TestUnsupported |= !SupportsAVXNEConvert && Loader.RequiresAVXNEConvert();
-#endif
+  TestUnsupported |= !SupportsSHA512 && Loader.RequiresSHA512();
+  TestUnsupported |= !SupportsAVXIFMA && Loader.RequiresAVXIFMA();
+  TestUnsupported |= !SupportsAVXVNNIINT8 && Loader.RequiresAVXVNNIINT8();
+  TestUnsupported |= !SupportsAVXVNNIINT16 && Loader.RequiresAVXVNNIINT16();
 
 #ifdef _WIN32
   TestUnsupported |= Loader.RequiresLinux();
@@ -323,8 +286,6 @@ int main(int argc, char** argv, char** const envp) {
   };
 
 #else
-  auto SyscallHandler = FEX::WindowsHandlers::CreateSyscallHandler();
-
   auto DoMMap = [](uint64_t Address, size_t Size) -> void* {
     void* Result = FEXCore::Allocator::VirtualAlloc(reinterpret_cast<void*>(Address), Size, true);
     LOGMAN_THROW_A_FMT(Result == reinterpret_cast<void*>(Address), "Map Memory mmap failed");
@@ -340,8 +301,6 @@ int main(int argc, char** argv, char** const envp) {
   }
 
   if (!IsHostRunner) {
-    LongJumpHandler::RegisterLongJumpHandler(SignalDelegation.get());
-
     // Run through FEX
     if (!Loader.MapMemory(DoMmap)) {
       // failed to map
@@ -350,6 +309,8 @@ int main(int argc, char** argv, char** const envp) {
     }
 
     auto ParentThread = SyscallHandler->TM.CreateThread();
+    ParentThread->Thread->CurrentFrame->Pointers.SynchronousExceptionHandler =
+      reinterpret_cast<uintptr_t>(&SynchronousException::SynchronousExceptionHandler);
     ParentThread->Thread->CurrentFrame->State.rip = Loader.DefaultRIP();
     SyscallHandler->TM.TrackThread(ParentThread);
     SignalDelegation->RegisterTLSState(ParentThread);
@@ -358,7 +319,7 @@ int main(int argc, char** argv, char** const envp) {
       return 1;
     }
 
-    int LongJumpVal = setjmp(LongJumpHandler::LongJump);
+    int LongJumpVal = setjmp(SynchronousException::LongJump);
     if (!LongJumpVal) {
       CTX->ExecuteThread(ParentThread->Thread);
     }
@@ -409,9 +370,9 @@ int main(int argc, char** argv, char** const envp) {
 
   SyscallHandler.reset();
 
-  bool Passed = !LongJumpHandler::DidFault && Loader.CompareStates(&State, nullptr, SupportsAVX);
+  bool Passed = !SynchronousException::DidFault && Loader.CompareStates(&State, nullptr, SupportsAVX);
 
-  LogMan::Msg::IFmt("Faulted? {}", LongJumpHandler::DidFault ? "Yes" : "No");
+  LogMan::Msg::IFmt("Faulted? {}", SynchronousException::DidFault ? "Yes" : "No");
   LogMan::Msg::IFmt("Passed? {}", Passed ? "Yes" : "No");
 
 

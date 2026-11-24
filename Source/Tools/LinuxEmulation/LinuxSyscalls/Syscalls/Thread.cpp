@@ -394,6 +394,39 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
   }
 }
 
+uint64_t SyscallExit(FEXCore::Core::CpuStateFrame* Frame, int status) {
+  // No signal handler runs once a thread has called exit (Linux's do_exit). Block every signal before the teardown
+  // below frees the signal alt stack and the thread object: a signal landing in it ran FEX's handler on freed memory.
+  uint64_t AllSignals = ~0ULL;
+  ::syscall(SYS_rt_sigprocmask, SIG_BLOCK, &AllSignals, nullptr, sizeof(AllSignals));
+
+  // TLS/DTV teardown is something FEX can't control. Disable glibc checking when we leave a pthread.
+  // Since this thread is hard stopping, we can't track the TLS/DTV teardown in FEX's thread handling.
+  FEXCore::Allocator::YesIKnowImNotSupposedToUseTheGlibcAllocator::HardDisable();
+  auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+
+  if (ThreadObject->ThreadInfo.clear_child_tid) {
+    auto Addr = std::atomic_ref<int32_t>(*ThreadObject->ThreadInfo.clear_child_tid);
+    Addr.store(0);
+    syscall(SYSCALL_DEF(futex), ThreadObject->ThreadInfo.clear_child_tid, FUTEX_WAKE, ~0ULL, 0, 0, 0);
+  }
+
+  ThreadObject->StatusCode = status;
+
+  FEX::HLE::_SyscallHandler->UninstallTLSState(ThreadObject);
+
+  if (ThreadObject->ExecutionThread) {
+    // If this is a pthread based execution thread, then there is more work to be done.
+    // Delegate final deletion and cleanup to the pthreads Thread management.
+    FEX::LinuxEmulation::Threads::LongjumpDeallocateAndExit(ThreadObject, status);
+  } else {
+    FEX::HLE::_SyscallHandler->TM.DestroyThread(ThreadObject, true);
+    FEX::LinuxEmulation::Threads::DeallocateStackObjectAndExit(nullptr, status);
+  }
+  // This will never be reached
+  std::terminate();
+}
+
 void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(rt_sigreturn, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t {
     FEX::HLE::_SyscallHandler->GetSignalDelegator()->HandleSignalHandlerReturn(true);
@@ -450,38 +483,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                           return CloneHandler(Frame, &args);
                         }));
 
-  REGISTER_SYSCALL_IMPL(exit, [](FEXCore::Core::CpuStateFrame* Frame, int status) -> uint64_t {
-    // No signal handler runs once a thread has called exit (Linux's do_exit). Block every signal before the teardown
-    // below frees the signal alt stack and the thread object: a signal landing in it ran FEX's handler on freed memory.
-    uint64_t AllSignals = ~0ULL;
-    ::syscall(SYS_rt_sigprocmask, SIG_BLOCK, &AllSignals, nullptr, sizeof(AllSignals));
-
-    // TLS/DTV teardown is something FEX can't control. Disable glibc checking when we leave a pthread.
-    // Since this thread is hard stopping, we can't track the TLS/DTV teardown in FEX's thread handling.
-    FEXCore::Allocator::YesIKnowImNotSupposedToUseTheGlibcAllocator::HardDisable();
-    auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
-
-    if (ThreadObject->ThreadInfo.clear_child_tid) {
-      auto Addr = std::atomic_ref<int32_t>(*ThreadObject->ThreadInfo.clear_child_tid);
-      Addr.store(0);
-      syscall(SYSCALL_DEF(futex), ThreadObject->ThreadInfo.clear_child_tid, FUTEX_WAKE, ~0ULL, 0, 0, 0);
-    }
-
-    ThreadObject->StatusCode = status;
-
-    FEX::HLE::_SyscallHandler->UninstallTLSState(ThreadObject);
-
-    if (ThreadObject->ExecutionThread) {
-      // If this is a pthread based execution thread, then there is more work to be done.
-      // Delegate final deletion and cleanup to the pthreads Thread management.
-      FEX::LinuxEmulation::Threads::LongjumpDeallocateAndExit(ThreadObject, status);
-    } else {
-      FEX::HLE::_SyscallHandler->TM.DestroyThread(ThreadObject, true);
-      FEX::LinuxEmulation::Threads::DeallocateStackObjectAndExit(nullptr, status);
-    }
-    // This will never be reached
-    std::terminate();
-  });
+  REGISTER_SYSCALL_IMPL(exit, SyscallExit);
 
   REGISTER_SYSCALL_IMPL(prctl,
                         [](FEXCore::Core::CpuStateFrame* Frame, int option, unsigned long arg2, unsigned long arg3, unsigned long arg4,
@@ -493,8 +495,14 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                           switch (option) {
                           case PR_SET_SECCOMP: {
                             uint32_t Operation {};
-                            if (arg2 == SECCOMP_MODE_STRICT) Operation = SECCOMP_SET_MODE_STRICT;
-                            if (arg2 == SECCOMP_MODE_FILTER) Operation = SECCOMP_SET_MODE_FILTER;
+
+                            switch (arg2) {
+                            case SECCOMP_MODE_STRICT: Operation = SECCOMP_SET_MODE_STRICT; break;
+                            case SECCOMP_MODE_FILTER: Operation = SECCOMP_SET_MODE_FILTER; break;
+                            default:
+                              // Unknown or unsupported operation
+                              return -EINVAL;
+                            }
 
                             return FEX::HLE::_SyscallHandler->SeccompEmulator.Handle(Frame, Operation, 0, reinterpret_cast<void*>(arg3));
                           }
@@ -561,16 +569,15 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
       Result = -EINVAL; // We don't support CET, return EINVAL
       break;
     case 0x1011: // ARCH_GET_CPUID
-      // Linux returns !TIF_NOCPUID (arch/x86/kernel/process.c get_cpuid_mode): the live faulting state.
-      // Without the config option FEX behaves like a CPU without CPUID faulting (always enabled).
-      return FEX::HLE::_SyscallHandler->TM.EnableCPUIDFaulting() ? (Frame->CPUIDFault == 0) : 1;
+      return (Frame->State.CoreFlags & FEXCore::Core::CoreFlagsEnum::CPUID_ENABLED) == FEXCore::Core::CoreFlagsEnum::CPUID_ENABLED ? 1 : 0;
     case 0x1012: // ARCH_SET_CPUID
-      if (!FEX::HLE::_SyscallHandler->TM.EnableCPUIDFaulting()) {
-        // No CPUID-faulting support: a real kernel returns -ENODEV here.
-        return -ENODEV;
+      if (addr == 0) {
+        // Disable CPUID (thus enabling CPUID faulting)
+        Frame->State.CoreFlags = Frame->State.CoreFlags & ~FEXCore::Core::CoreFlagsEnum::CPUID_ENABLED;
+      } else {
+        // Enable CPUID (thus disabling CPUID faulting)
+        Frame->State.CoreFlags = Frame->State.CoreFlags | FEXCore::Core::CoreFlagsEnum::CPUID_ENABLED;
       }
-      // cpuid_enabled != 0 enables CPUID, 0 disables it (which makes CPUID raise #GP; see CPUIDOp).
-      Frame->CPUIDFault = addr ? 0 : 1;
       return 0;
     default:
       LogMan::Msg::EFmt("Unknown prctl: 0x{:x}", code);

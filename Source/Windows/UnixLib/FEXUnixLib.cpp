@@ -47,6 +47,9 @@ using unixlib_entry_t = NTSTATUS (*)(void*);
 #ifndef PR_SET_VMA_ANON_NAME
 #define PR_SET_VMA_ANON_NAME 0
 #endif
+#ifndef PR_GET_TPIDRRO_CPU
+#define PR_GET_TPIDRRO_CPU 0x7F1DBB0
+#endif
 #endif
 
 static NTSTATUS FEXUnixLib_SetHardwareTSOControlHandler([[maybe_unused]] void* _Args) {
@@ -235,6 +238,17 @@ static NTSTATUS FEXUnixLib_GetPIDHandler(void* _Args) {
   Args->Result = ::getpid();
   return STATUS_SUCCESS;
 }
+
+static NTSTATUS FEXUnixLib_CheckSupportsTPIDRRO_CPUHandler([[maybe_unused]] void* _Args) {
+#ifdef __APPLE__
+  return STATUS_NOT_SUPPORTED;
+#else
+  auto Args = reinterpret_cast<FEXUnixLib_CheckSupportsTPIDRRO_CPU*>(_Args);
+  Args->Result = prctl(PR_GET_TPIDRRO_CPU, 0, 0, 0, 0);
+  return STATUS_SUCCESS;
+#endif
+}
+
 extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
   FEXUnixLib_SetHardwareTSOControlHandler,
   FEXUnixLib_SetKernelUnalignedAtomicControlHandler,
@@ -244,6 +258,7 @@ extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
   FEXUnixLib_DeleteSHMStatsFileHandler,
   FEXUnixLib_MapFileHandler,
   FEXUnixLib_GetPIDHandler,
+  FEXUnixLib_CheckSupportsTPIDRRO_CPUHandler,
 };
 
 static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == ToUnderlying(FEXUnixLibFunctions::MAX));

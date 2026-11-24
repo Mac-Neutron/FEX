@@ -3025,7 +3025,7 @@ void OpDispatchBuilder::XSaveOpImpl(OpcodeArgs) {
     StoreIfFlagSet(1, [this, Op] { SaveSSEState(XSaveBase(Op)); });
   }
   // AVX
-  if (CTX->HostFeatures.SupportsAVX) {
+  if (CTX->HostFeatures.SupportsAVX()) {
     StoreIfFlagSet(2, [this, Op] { std::invoke(SaveAVXStateFunc, this, XSaveBase(Op)); });
   }
 
@@ -3232,7 +3232,7 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
     RestoreIfFlagSetOrDefault(1, [this, Op] { RestoreSSEState(XSaveBase(Op)); }, [this] { DefaultSSEState(); });
   }
   // AVX
-  if (CTX->HostFeatures.SupportsAVX) {
+  if (CTX->HostFeatures.SupportsAVX()) {
     RestoreIfFlagSetOrDefault(
       2, [this, Op] { std::invoke(RestoreAVXStateFunc, this, XSaveBase(Op)); }, [this] { std::invoke(DefaultAVXStateFunc, this); });
   }
@@ -6077,6 +6077,34 @@ void OpDispatchBuilder::AVXVBCSTNEBF162PS(OpcodeArgs) {
   // bfloat16->float32 is left-shift by 16.
   Src = _VShlI(DstSize, OpSize::i32Bit, Src, 16);
   Src = _VDupElement(DstSize, OpSize::i32Bit, Src, 0);
+
+  StoreResultFPR(Op, Src);
+}
+
+void OpDispatchBuilder::AVXVBCSTNESH2PS(OpcodeArgs) {
+  const auto DstSize = OpSizeFromDst(Op);
+
+  auto Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+
+  // float16 is converted to fp32 and broadcast through the vector.
+  Src = _Float_FToF(OpSize::i32Bit, OpSize::i16Bit, Src);
+  Src = _VDupElement(DstSize, OpSize::i32Bit, Src, 0);
+
+  StoreResultFPR(Op, Src);
+}
+
+void OpDispatchBuilder::AVXVCVTNEEPH2PS(OpcodeArgs, bool Even) {
+  const auto DstSize = OpSizeFromDst(Op);
+
+  auto Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+
+  // float16 is converted to fp32 and broadcast through the vector.
+  if (Even) {
+    Src = _VUnZip(DstSize, OpSize::i16Bit, Src, Src);
+  } else {
+    Src = _VUnZip2(DstSize, OpSize::i16Bit, Src, Src);
+  }
+  Src = _Vector_FToF(DstSize, OpSize::i32Bit, Src, OpSize::i16Bit);
 
   StoreResultFPR(Op, Src);
 }

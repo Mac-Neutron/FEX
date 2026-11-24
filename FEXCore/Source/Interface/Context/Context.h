@@ -358,7 +358,6 @@ public:
     FEX_CONFIG_OPT(SingleStepConfig, SINGLESTEP);
     FEX_CONFIG_OPT(GdbServer, GDBSERVER);
     FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
-    FEX_CONFIG_OPT(EnableCPUIDFaulting, ENABLECPUIDFAULTING);
     FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
     FEX_CONFIG_OPT(VectorTSOEnabled, VECTORTSOENABLED);
     FEX_CONFIG_OPT(MemcpySetTSOEnabled, MEMCPYSETTSOENABLED);
@@ -461,14 +460,6 @@ public:
     UpdateAtomicTSOEmulationConfig();
   }
 
-  void EnableExitOnHLT() override {
-    ExitOnHLT = true;
-  }
-
-  bool ExitOnHLTEnabled() const {
-    return ExitOnHLT;
-  }
-
   bool AreMonoHacksActive() const {
     return Config.MonoHacks && MonoDetected;
   }
@@ -504,7 +495,6 @@ private:
   bool VectorAtomicTSOEmulationEnabled = false;
   bool MemcpyAtomicTSOEmulationEnabled = false;
 
-  bool ExitOnHLT = false;
   FEX_CONFIG_OPT(AppFilename, APP_FILENAME);
 
   std::shared_mutex CustomIRMutex;
